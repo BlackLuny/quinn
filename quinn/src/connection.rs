@@ -548,6 +548,15 @@ impl Connection {
             .clone_box()
     }
 
+    /// Swap the congestion controller for the primary path at runtime.
+    ///
+    /// Upstream 0.11.16 has no such API; hysteria2 Brutal's rate is only known after /auth.
+    pub fn set_congestion_controller(&self, controller: Box<dyn Controller>) {
+        let mut conn = self.0.state.lock("set_congestion_controller");
+        conn.inner.set_congestion_controller(controller);
+        conn.wake();
+    }
+
     /// Parameters negotiated during the handshake
     ///
     /// Guaranteed to return `Some` on fully established connections or after

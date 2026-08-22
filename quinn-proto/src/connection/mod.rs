@@ -1382,6 +1382,16 @@ impl Connection {
         self.path.congestion.as_ref()
     }
 
+    /// Swap the congestion controller for the primary path at runtime.
+    ///
+    /// Upstream 0.11.16 has no such API; hysteria2 Brutal's rate is only known after /auth.
+    /// Replaces only the controller object on the primary path; RTT and MTU state are left
+    /// unchanged. The caller should construct `controller` from `current_mtu` and existing
+    /// estimates.
+    pub fn set_congestion_controller(&mut self, controller: Box<dyn Controller>) {
+        self.path.congestion = controller;
+    }
+
     /// Resets path-specific settings.
     ///
     /// This will force-reset several subsystems related to a specific network path.
