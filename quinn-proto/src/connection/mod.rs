@@ -75,7 +75,7 @@ use spaces::Retransmits;
 use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
 mod stats;
-pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
+pub use stats::{ConnectionStats, FlowControlStats, FrameStats, PathStats, ReceiveStreamStats, UdpStats};
 
 mod streams;
 #[cfg(fuzzing)]
@@ -1263,10 +1263,23 @@ impl Connection {
     pub fn stats(&self) -> ConnectionStats {
         let mut stats = self.stats;
         stats.path.rtt = self.path.rtt.get();
+        stats.path.min_rtt = self.path.rtt.sampled_min();
         stats.path.cwnd = self.path.congestion.window();
         stats.path.current_mtu = self.path.mtud.current_mtu();
+        stats.flow_control = self.streams.flow_control_stats();
 
         stats
+    }
+
+    /// Delivery counters for active receive streams. Scans live stream state.
+    pub fn receive_stream_stats(&self) -> Vec<ReceiveStreamStats> {
+        self.streams.receive_stream_stats()
+    }
+
+    /// Increase the per-stream receive window. Decreases are ignored.
+    /// Open streams receive credit immediately; future streams on their first read.
+    pub fn set_stream_receive_window(&mut self, window: VarInt) {
+        self.streams.set_stream_receive_window(window, &mut self.spaces[SpaceId::Data].pending);
     }
 
     /// Ping the remote endpoint

@@ -653,6 +653,19 @@ impl Connection {
         conn.wake();
     }
 
+    /// Increase the per-stream receive window. Decreases are ignored.
+    /// Open streams receive credit immediately; future streams on their first read.
+    pub fn set_stream_receive_window(&self, window: VarInt) {
+        let mut conn = self.0.state.lock("set_stream_receive_window");
+        conn.inner.set_stream_receive_window(window);
+        conn.wake();
+    }
+
+    /// Delivery counters for active receive streams. Scans live stream state.
+    pub fn receive_stream_stats(&self) -> Vec<proto::ReceiveStreamStats> {
+        self.0.state.lock("receive_stream_stats").inner.receive_stream_stats()
+    }
+
     /// Modify the number of remotely initiated bidirectional streams that may be concurrently open
     ///
     /// No streams may be opened by the peer unless fewer than `count` are already open. Large

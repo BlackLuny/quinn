@@ -308,6 +308,11 @@ impl RttEstimator {
         self.smoothed.unwrap_or(self.latest)
     }
 
+    /// Measured minimum RTT, excluding the pre-handshake initial estimate.
+    pub(super) fn sampled_min(&self) -> Option<Duration> {
+        self.smoothed.map(|_| self.min)
+    }
+
     /// Conservative estimate of RTT
     ///
     /// Takes the maximum of smoothed and latest RTT, as recommended
@@ -448,5 +453,19 @@ impl InFlight {
     fn remove(&mut self, packet: &SentPacket) {
         self.bytes -= u64::from(packet.size);
         self.ack_eliciting -= u64::from(packet.ack_eliciting);
+    }
+}
+
+#[cfg(test)]
+mod adaptive_rtt_tests {
+    use super::*;
+    #[test]
+    fn initial_rtt_is_not_a_measurement() {
+        let mut rtt = RttEstimator::new(Duration::from_millis(100));
+        assert_eq!(rtt.sampled_min(), None);
+        rtt.update(Duration::ZERO, Duration::from_millis(300));
+        assert_eq!(rtt.sampled_min(), Some(Duration::from_millis(300)));
+        rtt.update(Duration::ZERO, Duration::from_secs(3));
+        assert_eq!(rtt.sampled_min(), Some(Duration::from_millis(300)));
     }
 }

@@ -224,6 +224,12 @@ impl Assembler {
         self.bytes_read
     }
 
+    /// An ordered reader cannot progress because the next available chunk follows a gap.
+    /// Contiguous data waiting for a slow application is deliberately excluded.
+    pub(super) fn read_blocked_on_gap(&self) -> bool {
+        self.state.is_ordered() && self.data.peek().is_some_and(|chunk| chunk.offset > self.bytes_read)
+    }
+
     /// Discard all buffered data
     pub(super) fn clear(&mut self) {
         self.data.clear();
@@ -669,5 +675,23 @@ mod test {
 
     fn next(x: &mut Assembler, size: usize) -> Option<Bytes> {
         x.read(size, true).map(|chunk| chunk.bytes)
+    }
+}
+
+#[cfg(test)]
+mod adaptive_gap_tests {
+    use super::*;
+    #[test]
+    fn gap_is_distinct_from_application_backpressure() {
+        let mut assembler = Assembler::new();
+        assembler.insert(0, Bytes::from_static(b"abcd"), 4).unwrap();
+        assert!(!assembler.read_blocked_on_gap());
+        assembler.read(1, true).unwrap();
+        assert!(!assembler.read_blocked_on_gap());
+        assembler.read(3, true).unwrap();
+        assembler.insert(8, Bytes::from_static(b"ijkl"), 4).unwrap();
+        assert!(assembler.read_blocked_on_gap());
+        assembler.ensure_ordering(false).unwrap();
+        assert!(!assembler.read_blocked_on_gap());
     }
 }
