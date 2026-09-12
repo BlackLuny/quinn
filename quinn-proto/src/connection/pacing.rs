@@ -16,6 +16,9 @@ pub(super) struct Pacer {
     capacity: u64,
     last_window: u64,
     last_mtu: u16,
+    /// Last controller-declared pacing rate (bytes/s), so a change resizes
+    /// the bucket the same way a window change does.
+    last_rate: Option<u64>,
     tokens: u64,
     prev: Instant,
 }
@@ -28,6 +31,7 @@ impl Pacer {
             capacity,
             last_window: window,
             last_mtu: mtu,
+            last_rate: None,
             tokens: capacity,
             prev: now,
         }
@@ -45,12 +49,27 @@ impl Pacer {
     ///
     /// The 5/4 ratio used here comes from the suggestion that N = 1.25 in the draft IETF RFC for
     /// QUIC.
+    ///
+    /// `pacing_rate` is the controller's [`ControllerMetrics::pacing_rate`]
+    /// (bits/s) when it declares one. Without it the bucket refills at
+    /// `1.25 x window / srtt`, i.e. **the congestion window is the send rate**.
+    /// That is fine for window-based controllers, but a rate-based one
+    /// (Hysteria2 Brutal, whose whole contract is "send at exactly this many
+    /// bytes per second regardless of loss") cannot be expressed that way at
+    /// all: whenever `bps x srtt` falls below the controller's own minimum
+    /// window — small rates, or LAN/loopback RTTs — the floor sets the rate
+    /// and the declared one is ignored entirely. With a rate present the
+    /// bucket refills at that rate instead and the window goes back to being
+    /// what it is elsewhere: a cap on bytes in flight, not a throttle.
+    ///
+    /// [`ControllerMetrics::pacing_rate`]: crate::congestion::ControllerMetrics::pacing_rate
     pub(super) fn delay(
         &mut self,
         smoothed_rtt: Duration,
         bytes_to_send: u64,
         mtu: u16,
         window: u64,
+        pacing_rate: Option<u64>,
         now: Instant,
     ) -> Option<Instant> {
         debug_assert_ne!(
@@ -58,18 +77,55 @@ impl Pacer {
             "zero-sized congestion control window is nonsense"
         );
 
-        if window != self.last_window || mtu != self.last_mtu {
-            self.capacity = optimal_capacity(smoothed_rtt, window, mtu);
+        // bits/s -> bytes/s. A declared rate of 0 (or one that rounds to 0)
+        // is not a request to stall the connection; fall back to the window.
+        let rate = pacing_rate.map(|bits| bits / 8).filter(|bytes| *bytes > 0);
+
+        if window != self.last_window || mtu != self.last_mtu || rate != self.last_rate {
+            self.capacity = match rate {
+                Some(r) => rate_capacity(r, mtu),
+                None => optimal_capacity(smoothed_rtt, window, mtu),
+            };
 
             // Clamp the tokens
             self.tokens = self.capacity.min(self.tokens);
             self.last_window = window;
             self.last_mtu = mtu;
+            self.last_rate = rate;
         }
 
         // if we can already send a packet, there is no need for delay
         if self.tokens >= bytes_to_send {
             return None;
+        }
+
+        let time_elapsed = now.checked_duration_since(self.prev).unwrap_or_else(|| {
+            warn!("received a timestamp early than a previous recorded time, ignoring");
+            Default::default()
+        });
+
+        if let Some(rate) = rate {
+            // Plain token bucket at the declared rate. Deliberately not
+            // RTT-scaled: the whole point of a declared rate is that it does
+            // not move with the path.
+            let new_tokens = (u128::from(rate) * time_elapsed.as_nanos()) / NANOS_PER_SEC;
+            self.tokens = self
+                .tokens
+                .saturating_add(u64::try_from(new_tokens).unwrap_or(u64::MAX))
+                .min(self.capacity);
+
+            self.prev = now;
+
+            if self.tokens >= bytes_to_send {
+                return None;
+            }
+
+            let missing = bytes_to_send.max(self.capacity) - self.tokens;
+            let wait_nanos = (u128::from(missing) * NANOS_PER_SEC) / u128::from(rate);
+            let unscaled_delay =
+                Duration::from_nanos(u64::try_from(wait_nanos).unwrap_or(u64::MAX));
+
+            return Some(self.prev + (unscaled_delay / 5) * 4);
         }
 
         // we disable pacing for extremely large windows
@@ -78,11 +134,6 @@ impl Pacer {
         }
 
         let window = window as u32;
-
-        let time_elapsed = now.checked_duration_since(self.prev).unwrap_or_else(|| {
-            warn!("received a timestamp early than a previous recorded time, ignoring");
-            Default::default()
-        });
 
         if smoothed_rtt.as_nanos() == 0 {
             return None;
@@ -136,6 +187,27 @@ fn optimal_capacity(smoothed_rtt: Duration, window: u64, mtu: u16) -> u64 {
     capacity.clamp(MIN_BURST_SIZE * mtu as u64, MAX_BURST_SIZE * mtu as u64)
 }
 
+/// Burst size for a controller-declared byte rate: one
+/// [`BURST_INTERVAL_NANOS`] worth of bytes, clamped exactly like the
+/// window-derived path.
+///
+/// The [`MIN_BURST_SIZE`] floor is **not** cosmetic here. Refills are capped
+/// at the capacity, and the wakeup is scheduled at 4/5 of the fill time — so
+/// tokens are only preserved while scheduler jitter stays under 20 % of that
+/// fill time. A bucket sized strictly at 2 ms of a 10 Mbps target is 2500 B,
+/// i.e. a 0.4 ms margin against a timer whose granularity is ~1 ms: every
+/// late wakeup then silently drops the overrun and the connection settles
+/// *below* the declared rate (measured 0.72x before this floor went in).
+/// Ten MTUs at that rate is ~12 ms of fill, whose 20 % margin comfortably
+/// covers the jitter — and it is the same burst the window-derived path
+/// already permits, so this is not a new burstiness.
+fn rate_capacity(rate_bytes_per_s: u64, mtu: u16) -> u64 {
+    let capacity = ((u128::from(rate_bytes_per_s) * BURST_INTERVAL_NANOS) / NANOS_PER_SEC) as u64;
+    capacity.clamp(MIN_BURST_SIZE * u64::from(mtu), MAX_BURST_SIZE * u64::from(mtu))
+}
+
+const NANOS_PER_SEC: u128 = 1_000_000_000;
+
 /// The burst interval
 ///
 /// The capacity will we refilled in 4/5 of that time.
@@ -162,19 +234,101 @@ mod tests {
 
         assert!(
             Pacer::new(rtt, 30000, 1500, new_instant)
-                .delay(Duration::from_micros(0), 0, 1500, 1, old_instant)
+                .delay(Duration::from_micros(0), 0, 1500, 1, None, old_instant)
                 .is_none()
         );
         assert!(
             Pacer::new(rtt, 30000, 1500, new_instant)
-                .delay(Duration::from_micros(0), 1600, 1500, 1, old_instant)
+                .delay(Duration::from_micros(0), 1600, 1500, 1, None, old_instant)
                 .is_none()
         );
         assert!(
             Pacer::new(rtt, 30000, 1500, new_instant)
-                .delay(Duration::from_micros(0), 1500, 1500, 3000, old_instant)
+                .delay(Duration::from_micros(0), 1500, 1500, 3000, None, old_instant)
                 .is_none()
         );
+    }
+
+    /// A declared rate must set the send rate even when the window is at a
+    /// controller's floor and the RTT is sub-millisecond — the exact shape in
+    /// which the window-derived refill silently ignores the rate.
+    ///
+    /// Mutation: drop the `rate` branch in `delay` and the drained pacer is
+    /// refilled at `1.25 x window / srtt` = ~2 packets per 50 us = ~450 Mbps,
+    /// so `emitted` blows past the 10 Mbps budget and this fails.
+    #[test]
+    fn declared_rate_paces_independently_of_window() {
+        let mtu = 1452u16;
+        let rtt = Duration::from_micros(50);
+        // Brutal at the cwnd floor: window is 2 MTU, i.e. ~460 Mbps if the
+        // window were the rate.
+        let window = 2 * u64::from(mtu) + 1;
+        let bits_per_s = 10_000_000u64;
+        let bytes_per_s = bits_per_s / 8;
+
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        // Drain the initial bucket so we measure the refill, not the burst.
+        pacer.tokens = 0;
+
+        let step = Duration::from_micros(50);
+        let run = Duration::from_millis(200);
+        let mut now = start;
+        let mut emitted = 0u64;
+        while now < start + run {
+            if pacer
+                .delay(rtt, u64::from(mtu), mtu, window, Some(bits_per_s), now)
+                .is_none()
+            {
+                pacer.on_transmit(mtu);
+                emitted += u64::from(mtu);
+                continue;
+            }
+            now += step;
+        }
+
+        let budget = bytes_per_s * run.as_millis() as u64 / 1000;
+        assert!(
+            emitted <= budget + u64::from(mtu),
+            "declared 10 Mbps must not be exceeded: emitted {emitted} B > budget {budget} B"
+        );
+        assert!(
+            emitted * 2 >= budget,
+            "declared 10 Mbps must actually be reached: emitted {emitted} B < half of {budget} B"
+        );
+    }
+
+    /// A rate of 0 (or one that rounds to 0 bytes/s) is not a request to
+    /// stall: fall back to the window-derived refill.
+    #[test]
+    fn zero_declared_rate_falls_back_to_window() {
+        let mtu = 1500u16;
+        let rtt = Duration::from_millis(50);
+        let window = 2_000_000u64;
+        let now = Instant::now();
+
+        let mut pacer = Pacer::new(rtt, window, mtu, now);
+        assert_eq!(pacer.capacity, optimal_capacity(rtt, window, mtu));
+        assert!(pacer
+            .delay(rtt, u64::from(mtu), mtu, window, Some(0), now)
+            .is_none());
+        assert_eq!(pacer.capacity, optimal_capacity(rtt, window, mtu));
+        assert_eq!(pacer.last_rate, None);
+    }
+
+    /// Switching rate resizes the bucket, like a window change does.
+    #[test]
+    fn rate_change_resizes_capacity() {
+        let mtu = 1500u16;
+        let rtt = Duration::from_millis(50);
+        let window = 2_000_000u64;
+        let now = Instant::now();
+
+        let mut pacer = Pacer::new(rtt, window, mtu, now);
+        let _ = pacer.delay(rtt, u64::from(mtu), mtu, window, Some(80_000_000), now);
+        assert_eq!(pacer.capacity, rate_capacity(10_000_000, mtu));
+        let _ = pacer.delay(rtt, u64::from(mtu), mtu, window, Some(8_000_000), now);
+        assert_eq!(pacer.capacity, rate_capacity(1_000_000, mtu));
     }
 
     #[test]
@@ -215,27 +369,27 @@ mod tests {
         assert_eq!(pacer.tokens, pacer.capacity);
         let initial_tokens = pacer.tokens;
 
-        pacer.delay(rtt, mtu as u64, mtu, window * 2, now);
+        pacer.delay(rtt, mtu as u64, mtu, window * 2, None, now);
         assert_eq!(
             pacer.capacity,
             (2 * window as u128 * BURST_INTERVAL_NANOS / rtt.as_nanos()) as u64
         );
         assert_eq!(pacer.tokens, initial_tokens);
 
-        pacer.delay(rtt, mtu as u64, mtu, window / 2, now);
+        pacer.delay(rtt, mtu as u64, mtu, window / 2, None, now);
         assert_eq!(
             pacer.capacity,
             (window as u128 / 2 * BURST_INTERVAL_NANOS / rtt.as_nanos()) as u64
         );
         assert_eq!(pacer.tokens, initial_tokens / 2);
 
-        pacer.delay(rtt, mtu as u64, mtu * 2, window, now);
+        pacer.delay(rtt, mtu as u64, mtu * 2, window, None, now);
         assert_eq!(
             pacer.capacity,
             (window as u128 * BURST_INTERVAL_NANOS / rtt.as_nanos()) as u64
         );
 
-        pacer.delay(rtt, mtu as u64, 20_000, window, now);
+        pacer.delay(rtt, mtu as u64, 20_000, window, None, now);
         assert_eq!(pacer.capacity, 20_000_u64 * MIN_BURST_SIZE);
     }
 
@@ -251,7 +405,7 @@ mod tests {
 
         for _ in 0..packet_capacity {
             assert_eq!(
-                pacer.delay(rtt, mtu as u64, mtu, window, old_instant),
+                pacer.delay(rtt, mtu as u64, mtu, window, None, old_instant),
                 None,
                 "When capacity is available packets should be sent immediately"
             );
@@ -263,7 +417,7 @@ mod tests {
 
         assert_eq!(
             pacer
-                .delay(rtt, mtu as u64, mtu, window, old_instant)
+                .delay(rtt, mtu as u64, mtu, window, None, old_instant)
                 .expect("Send must be delayed")
                 .duration_since(old_instant),
             pace_duration
@@ -276,6 +430,7 @@ mod tests {
                 mtu as u64,
                 mtu,
                 window,
+                None,
                 old_instant + pace_duration / 2
             ),
             None
@@ -284,7 +439,7 @@ mod tests {
 
         for _ in 0..packet_capacity / 2 {
             assert_eq!(
-                pacer.delay(rtt, mtu as u64, mtu, window, old_instant),
+                pacer.delay(rtt, mtu as u64, mtu, window, None, old_instant),
                 None,
                 "When capacity is available packets should be sent immediately"
             );
@@ -299,6 +454,7 @@ mod tests {
                 mtu as u64,
                 mtu,
                 window,
+                None,
                 old_instant + pace_duration * 3 / 2
             ),
             None
