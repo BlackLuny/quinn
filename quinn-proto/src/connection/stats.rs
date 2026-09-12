@@ -134,6 +134,8 @@ impl std::fmt::Debug for FrameStats {
 #[derive(Debug, Default, Copy, Clone)]
 #[non_exhaustive]
 pub struct PathStats {
+    /// Smallest measured RTT on this path; None until a real sample is available.
+    pub min_rtt: Option<Duration>,
     /// Current best estimate of this connection's latency (round-trip-time)
     pub rtt: Duration,
     /// Current congestion window of the connection
@@ -157,6 +159,40 @@ pub struct PathStats {
     pub current_mtu: u16,
 }
 
+/// Stream flow control, excluding datagrams and discarded receive data.
+#[derive(Debug, Default, Copy, Clone)]
+#[non_exhaustive]
+pub struct FlowControlStats {
+    /// STREAM bytes delivered to the application.
+    pub received_bytes: u64,
+    /// STREAM bytes newly acknowledged by the peer.
+    pub sent_bytes: u64,
+    /// Local cap on unacknowledged STREAM bytes.
+    pub send_window: u64,
+    /// Unoccupied part of the local send window.
+    pub send_window_available: u64,
+    /// Configured connection receive window.
+    pub receive_window: u64,
+    /// Advertised connection credit not yet consumed (including offset gaps).
+    pub receive_window_available: u64,
+    /// Current per-stream receive window.
+    pub stream_receive_window: u64,
+}
+
+/// Delivery progress for an active receive stream. Obtained separately from O(1) stats().
+#[derive(Debug, Copy, Clone)]
+#[non_exhaustive]
+pub struct ReceiveStreamStats {
+    /// Distance from the consumed prefix to the highest received offset (includes gaps).
+    pub unread_span: u64,
+    /// Ordered reading is blocked by missing data, rather than a slow application.
+    pub read_blocked_on_gap: bool,
+    /// Stream whose peer may still benefit from additional credit.
+    pub id: crate::StreamId,
+    /// Bytes delivered to the application, including unordered reads.
+    pub received_bytes: u64,
+}
+
 /// Connection statistics
 #[derive(Debug, Default, Copy, Clone)]
 #[non_exhaustive]
@@ -171,4 +207,6 @@ pub struct ConnectionStats {
     pub frame_rx: FrameStats,
     /// Statistics related to the current transmission path
     pub path: PathStats,
+    /// Stream flow-control state and delivery counters.
+    pub flow_control: FlowControlStats,
 }

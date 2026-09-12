@@ -15,7 +15,7 @@ use super::{
 use crate::{
     Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     coding::BufMutExt,
-    connection::stats::FrameStats,
+    connection::stats::{FlowControlStats, FrameStats, ReceiveStreamStats},
     frame::{self, FrameStruct, StreamMetaVec},
     transport_parameters::TransportParameters,
 };
@@ -121,6 +121,8 @@ pub struct StreamsState {
     pub(super) data_sent: u64,
     /// Sum of end offsets of all receive streams. Includes gaps, so it's an upper bound.
     data_recvd: u64,
+    pub(super) data_read: u64,
+    data_acked: u64,
     /// Total quantity of unacknowledged outgoing data
     pub(super) unacked_data: u64,
     /// Configured upper bound for `unacked_data`.
@@ -129,6 +131,7 @@ pub struct StreamsState {
     pub(super) send_window: u64,
     /// Configured upper bound for how much unacked data the peer can send us per stream
     pub(super) stream_receive_window: u64,
+    pub(super) initial_stream_receive_window: u64,
 
     // Pertinent state from the TransportParameters supplied by the peer
     initial_max_stream_data_uni: VarInt,
@@ -174,9 +177,12 @@ impl StreamsState {
             sent_max_data: receive_window,
             data_sent: 0,
             data_recvd: 0,
+            data_read: 0,
+            data_acked: 0,
             unacked_data: 0,
             send_window,
             stream_receive_window: stream_receive_window.into(),
+            initial_stream_receive_window: stream_receive_window.into(),
             initial_max_stream_data_uni: 0u32.into(),
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
@@ -263,7 +269,7 @@ impl StreamsState {
         let rs = match self
             .recv
             .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
+            .map(get_or_insert_recv(self.initial_stream_receive_window))
         {
             Some(rs) => rs,
             None => {
@@ -316,7 +322,7 @@ impl StreamsState {
         let rs = match self
             .recv
             .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
+            .map(get_or_insert_recv(self.initial_stream_receive_window))
         {
             Some(stream) => stream,
             None => {
@@ -656,7 +662,11 @@ impl StreamsState {
             return;
         }
         let id = frame.id;
-        self.unacked_data -= frame.offsets.end - frame.offsets.start;
+        let acked = frame.offsets.end - frame.offsets.start;
+        self.unacked_data -= acked;
+        // The packet/stream retransmit machinery hands each byte here once.
+        // Reset streams return above: discarded bytes are not delivered bytes.
+        self.data_acked = self.data_acked.saturating_add(acked);
         if !stream.ack(frame) {
             // The stream is unfinished or may still need retransmits
             return;
@@ -943,8 +953,49 @@ impl StreamsState {
     }
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
-        self.free_recv.push(recv.free(self.stream_receive_window));
+        self.free_recv.push(recv.free(self.initial_stream_receive_window));
         self.stream_freed(id, StreamHalf::Recv);
+    }
+
+    pub(crate) fn flow_control_stats(&self) -> FlowControlStats {
+        FlowControlStats {
+            received_bytes: self.data_read,
+            sent_bytes: self.data_acked,
+            send_window: self.send_window,
+            send_window_available: self.send_window.saturating_sub(self.unacked_data),
+            receive_window: self.receive_window,
+            receive_window_available: self.sent_max_data.into_inner().saturating_sub(self.data_recvd),
+            stream_receive_window: self.stream_receive_window,
+        }
+    }
+
+    pub(crate) fn receive_stream_stats(&self) -> Vec<ReceiveStreamStats> {
+        self.recv.iter().filter_map(|(&id, slot)| {
+            let recv = slot.as_ref()?.as_open_recv()?;
+            recv.can_send_flow_control().then(|| ReceiveStreamStats {
+                id, received_bytes: recv.assembler.bytes_read(),
+                unread_span: recv.end.saturating_sub(recv.assembler.bytes_read()),
+                read_blocked_on_gap: recv.assembler.read_blocked_on_gap(),
+            })
+        }).collect()
+    }
+
+    pub(crate) fn set_stream_receive_window(&mut self, window: VarInt, pending: &mut Retransmits) {
+        let window = window.into_inner();
+        if window <= self.stream_receive_window { return; }
+        self.stream_receive_window = window;
+        // recv also contains preallocated slots. Never advertise an unopened stream.
+        for (&id, slot) in &mut self.recv {
+            if id.initiator() != self.side && id.index() >= self.next_remote[id.dir() as usize] {
+                continue;
+            }
+            let recv = get_or_insert_recv(self.initial_stream_receive_window)(slot);
+            if recv.can_send_flow_control() {
+                pending.max_stream_data.insert(id);
+            }
+        }
+        // Future streams start with the actual transport-parameter credit.
+        // Their first read issues the larger MAX_STREAM_DATA via Chunks::finalize.
     }
 
     pub(super) fn max_send_data(&self, id: StreamId) -> VarInt {
@@ -999,6 +1050,102 @@ mod tests {
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
         )
+    }
+
+    #[test]
+    fn adaptive_ack_progress_excludes_reset_streams() {
+        let mut sender = make(Side::Server);
+        sender.set_params(&TransportParameters {
+            initial_max_data: VarInt::MAX,
+            initial_max_stream_data_uni: VarInt::MAX,
+            initial_max_streams_uni: 2u32.into(),
+            ..TransportParameters::default()
+        });
+        let state = ConnState::Established;
+        let mut pending = Retransmits::default();
+        let id = Streams { state: &mut sender, conn_state: &state }.open(Dir::Uni).unwrap();
+        {
+            let mut stream = SendStream { id, state: &mut sender, pending: &mut pending, conn_state: &state };
+            assert_eq!(stream.write(b"abcdefgh"), Ok(8));
+        }
+        assert_eq!(sender.flow_control_stats().sent_bytes, 0);
+        sender.received_ack_of(frame::StreamMeta { id, offsets: 0..3, fin: false });
+        assert_eq!(sender.flow_control_stats().sent_bytes, 3);
+        {
+            let mut stream = SendStream { id, state: &mut sender, pending: &mut pending, conn_state: &state };
+            stream.reset(0u32.into()).unwrap();
+        }
+        sender.received_ack_of(frame::StreamMeta { id, offsets: 3..8, fin: false });
+        assert_eq!(sender.flow_control_stats().sent_bytes, 3);
+        assert_eq!(sender.flow_control_stats().send_window_available, sender.send_window);
+    }
+
+    #[test]
+    fn adaptive_delivery_excludes_discarded_bytes_and_finalizes_once() {
+        let mut receiver = make(Side::Server);
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        let _ = receiver.received(frame::Stream {
+            id, offset: 0, fin: false, data: Bytes::from_static(b"abcdefgh"),
+        }, 8).unwrap();
+        assert_eq!(receiver.flow_control_stats().received_bytes, 0);
+        let mut pending = Retransmits::default();
+        {
+            let mut stream = RecvStream { id, state: &mut receiver, pending: &mut pending };
+            let mut chunks = stream.read(true).unwrap();
+            assert_eq!(chunks.next(3).unwrap().unwrap().bytes.as_ref(), b"abc");
+            let _ = chunks.finalize();
+        }
+        assert_eq!(receiver.flow_control_stats().received_bytes, 3);
+        assert_eq!(receiver.receive_stream_stats()[0].received_bytes, 3);
+        RecvStream { id, state: &mut receiver, pending: &mut pending }.stop(0u32.into()).unwrap();
+        assert_eq!(receiver.flow_control_stats().received_bytes, 3);
+        assert!(receiver.receive_stream_stats().is_empty());
+        let _ = receiver.received_reset(frame::ResetStream { id, error_code: 0u32.into(), final_offset: 8u32.into() }).unwrap();
+        assert_eq!(receiver.flow_control_stats().received_bytes, 3);
+    }
+
+    #[test]
+    fn adaptive_growth_preserves_initial_credit_for_future_streams() {
+        let mut receiver = make(Side::Server);
+        let initial = receiver.stream_receive_window;
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        let next = StreamId::new(Side::Client, Dir::Uni, 1);
+        let _ = receiver.received(frame::Stream { id, offset: 0, fin: false, data: Bytes::from_static(b"a") }, 1).unwrap();
+        let mut pending = Retransmits::default();
+        receiver.set_stream_receive_window(VarInt::from_u64(initial * 2).unwrap(), &mut pending);
+        assert!(pending.max_stream_data.contains(&id));
+        assert!(!pending.max_stream_data.contains(&next));
+        receiver.set_stream_receive_window(1u32.into(), &mut pending);
+        assert_eq!(receiver.stream_receive_window, initial * 2);
+        let _ = receiver.received(frame::Stream { id: next, offset: 0, fin: false, data: Bytes::from_static(b"b") }, 1).unwrap();
+        {
+            let mut stream = RecvStream { id: next, state: &mut receiver, pending: &mut pending };
+            let mut chunks = stream.read(true).unwrap();
+            assert!(chunks.next(1).unwrap().is_some());
+            let _ = chunks.finalize();
+        }
+        assert!(pending.max_stream_data.contains(&next));
+        // Queued credit isn't sent credit: the peer cannot use it until advertised.
+        assert!(receiver.received(frame::Stream {
+            id: next, offset: initial, fin: false, data: Bytes::from_static(b"x"),
+        }, 1).is_err());
+    }
+
+    #[test]
+    fn adaptive_window_limit_does_not_overflow_varint_after_read() {
+        let mut receiver = make(Side::Server);
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        let _ = receiver.received(frame::Stream { id, offset: 0, fin: false, data: Bytes::from_static(b"a") }, 1).unwrap();
+        let mut pending = Retransmits::default();
+        receiver.set_stream_receive_window(VarInt::MAX, &mut pending);
+        {
+            let mut stream = RecvStream { id, state: &mut receiver, pending: &mut pending };
+            let mut chunks = stream.read(true).unwrap();
+            chunks.next(1).unwrap();
+            let _ = chunks.finalize();
+        }
+        let recv = receiver.recv.get_mut(&id).unwrap().as_mut().unwrap().as_open_recv_mut().unwrap();
+        assert_eq!(recv.max_stream_data(VarInt::MAX.into_inner()).0, VarInt::MAX.into_inner());
     }
 
     #[test]

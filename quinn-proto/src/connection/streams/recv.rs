@@ -110,7 +110,8 @@ impl Recv {
     /// `false` the new window should only be transmitted if a previous transmission
     /// had failed.
     pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
-        let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
+        let max_stream_data = self.assembler.bytes_read().saturating_add(stream_receive_window)
+            .min(VarInt::MAX.into_inner());
 
         // Only announce a window update if it's significant enough
         // to make it worthwhile sending a MAX_STREAM_DATA frame.
@@ -119,7 +120,7 @@ impl Recv {
         // less updates. A fixed size would also work - but it would need to be
         // smaller than `stream_receive_window` in order to make sure the stream
         // does not get stuck.
-        let diff = max_stream_data - self.sent_max_stream_data;
+        let diff = max_stream_data.saturating_sub(self.sent_max_stream_data);
         let transmit = self.can_send_flow_control() && diff >= (stream_receive_window / 8);
         (max_stream_data, ShouldTransmit(transmit))
     }
@@ -266,7 +267,7 @@ impl<'a> Chunks<'a> {
         };
 
         let mut recv =
-            match get_or_insert_recv(streams.stream_receive_window)(entry.get_mut()).stopped {
+            match get_or_insert_recv(streams.initial_stream_receive_window)(entry.get_mut()).stopped {
                 true => return Err(ReadableError::ClosedStream),
                 false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
             };
@@ -374,6 +375,7 @@ impl<'a> Chunks<'a> {
         }
 
         // Issue connection-level flow control credit for any data we read regardless of state
+        self.streams.data_read = self.streams.data_read.saturating_add(self.read);
         let max_data = self.streams.add_read_credits(self.read);
         self.pending.max_data |= max_data.0;
         should_transmit |= max_data.0;
