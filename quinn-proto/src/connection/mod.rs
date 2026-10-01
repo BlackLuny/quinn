@@ -1103,7 +1103,9 @@ impl Connection {
                 // If this packet could initiate a migration and we're a client or a server that
                 // forbids migration, drop the datagram. This could be relaxed to heuristically
                 // permit NAT-rebinding-like migration.
-                if remote != self.path.remote && !self.side.remote_may_migrate() {
+                if remote != self.path.remote
+                    && !self.side.remote_may_migrate(self.path.remote, remote)
+                {
                     trace!("discarding packet from unrecognized peer {}", remote);
                     return;
                 }
@@ -1199,6 +1201,8 @@ impl Connection {
                     debug!("path validation failed");
                     if let Some((_, prev)) = self.prev_path.take() {
                         self.path = prev;
+                        // The endpoint indexes the peer's reset token by remote address.
+                        self.republish_reset_token();
                     }
                     self.path.challenge = None;
                     self.path.challenge_pending = false;
@@ -1403,6 +1407,11 @@ impl Connection {
     /// unchanged. The caller should construct `controller` from `current_mtu` and existing
     /// estimates.
     pub fn set_congestion_controller(&mut self, controller: Box<dyn Controller>) {
+        // A migration may still be unvalidated; if it fails the connection falls back to the
+        // previous path, which must not resurrect the controller this call replaces.
+        if let Some((_, prev)) = self.prev_path.as_mut() {
+            prev.congestion = controller.clone_box();
+        }
         self.path.congestion = controller;
     }
 
@@ -3061,7 +3070,10 @@ impl Connection {
             );
             self.migrate(now, remote);
             // Break linkability, if possible
-            self.update_rem_cid();
+            if !self.update_rem_cid() {
+                // No spare CID: the token stays, but the endpoint must look it up at the new address.
+                self.republish_reset_token();
+            }
             self.spin = false;
         }
 
@@ -3074,7 +3086,18 @@ impl Connection {
         // Reset rtt/congestion state for new path unless it looks like a NAT rebinding.
         // Note that the congestion window will not grow until validation terminates. Helps mitigate
         // amplification attacks performed by spoofing source addresses.
-        let mut new_path = if remote.is_ipv4() && remote.ip() == self.path.remote.ip() {
+        //
+        // Upstream only trusts the same-IP heuristic for IPv4. A server restricted to same-IP
+        // migration has every migration be a rebinding by construction, including IPv4 peers that
+        // a dual-stack socket reports as v4-mapped IPv6; keep the path state (and any congestion
+        // controller the application installed) for those too.
+        let same_ip_only = matches!(
+            self.side,
+            ConnectionSide::Server { ref server_config } if server_config.migration_same_ip_only
+        );
+        let mut new_path = if (remote.is_ipv4() || same_ip_only)
+            && same_host(self.path.remote, remote)
+        {
             PathData::from_previous(remote, &self.path, self.path_counter, now)
         } else {
             let peer_max_udp_payload_size =
@@ -3116,10 +3139,12 @@ impl Connection {
     }
 
     /// Switch to a previously unused remote connection ID, if possible
-    fn update_rem_cid(&mut self) {
+    ///
+    /// Returns whether the remote CID, and with it the reset token registration, changed.
+    fn update_rem_cid(&mut self) -> bool {
         let (reset_token, retired) = match self.rem_cids.next() {
             Some(x) => x,
-            None => return,
+            None => return false,
         };
 
         // Retire the current remote CID and any CIDs we had to skip.
@@ -3128,6 +3153,15 @@ impl Connection {
             .retire_cids
             .extend(retired);
         self.set_reset_token(reset_token);
+        true
+    }
+
+    /// Re-register the peer's current reset token under the address the path now uses
+    fn republish_reset_token(&mut self) {
+        if let Some(token) = self.peer_params.stateless_reset_token {
+            self.endpoint_events
+                .push_back(EndpointEventInner::ResetToken(self.path.remote, token));
+        }
     }
 
     fn set_reset_token(&mut self, reset_token: ResetToken) {
@@ -3798,10 +3832,25 @@ enum ConnectionSide {
     },
 }
 
+/// Whether two addresses name the same host: equal IP and, for IPv6, equal scope
+fn same_host(a: SocketAddr, b: SocketAddr) -> bool {
+    match (a, b) {
+        (SocketAddr::V6(a), SocketAddr::V6(b)) => a.ip() == b.ip() && a.scope_id() == b.scope_id(),
+        _ => a.ip() == b.ip(),
+    }
+}
+
 impl ConnectionSide {
-    fn remote_may_migrate(&self) -> bool {
+    fn remote_may_migrate(&self, current: SocketAddr, new: SocketAddr) -> bool {
         match self {
-            Self::Server { server_config } => server_config.migration,
+            Self::Server { server_config } => {
+                server_config.migration
+                    && (!server_config.migration_same_ip_only || same_host(current, new))
+                    && server_config
+                        .migration_filter
+                        .as_ref()
+                        .map_or(true, |allow| allow(current, new))
+            }
             Self::Client { .. } => false,
         }
     }

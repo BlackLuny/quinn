@@ -1,7 +1,7 @@
 use std::{
     convert::TryInto,
     mem,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
     sync::{Arc, Mutex},
 };
 
@@ -245,6 +245,69 @@ fn client_stateless_reset() {
             reason: ConnectionError::Reset
         })
     );
+}
+
+/// After a migration whose validation fails, the server is back on the old address and must still
+/// recognise a stateless reset the client sends from there: the endpoint looks reset tokens up by
+/// remote address.
+#[test]
+fn client_stateless_reset_after_failed_migration() {
+    let _guard = subscribe();
+    let mut key_material = vec![0; 64];
+    let mut rng = rand::rng();
+    rng.fill_bytes(&mut key_material);
+    let reset_key = hmac::Key::new(hmac::HMAC_SHA256, &key_material);
+
+    let mut endpoint_config = EndpointConfig::new(Arc::new(reset_key));
+    endpoint_config.cid_generator(move || Box::new(HashedConnectionIdGenerator::from_key(0)));
+    let endpoint_config = Arc::new(endpoint_config);
+
+    let mut config = server_config();
+    config.migration_same_ip_only(true);
+    let mut pair = Pair::new(endpoint_config.clone(), config);
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    let old = pair.client.addr;
+    let moved = SocketAddr::new(old.ip(), CLIENT_PORTS.lock().unwrap().next().unwrap());
+    pair.client.addr = moved;
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    pair.drive_server();
+    assert_eq!(pair.server_conn_mut(server_ch).remote_address(), moved);
+    // The client never answers the challenge: run the server alone until it gives up.
+    for _ in 0..200 {
+        pair.client.inbound.clear();
+        if pair.server_conn_mut(server_ch).remote_address() == old {
+            break;
+        }
+        if let Some(t) = pair.server.next_wakeup() {
+            pair.time = pair.time.max(t);
+        }
+        pair.drive_server();
+    }
+    assert_eq!(pair.server_conn_mut(server_ch).remote_address(), old);
+
+    // The client loses its state and answers the server from the old address.
+    pair.client.addr = old;
+    pair.client.endpoint =
+        Endpoint::new(endpoint_config, Some(Arc::new(server_config())), true, None);
+    pair.server.connections.get_mut(&server_ch).unwrap().close(
+        pair.time,
+        VarInt(42),
+        (&[0xab; 128][..]).into(),
+    );
+    pair.drive();
+    let mut reset = false;
+    while let Some(event) = pair.server_conn_mut(server_ch).poll() {
+        reset |= matches!(
+            event,
+            Event::ConnectionLost {
+                reason: ConnectionError::Reset
+            }
+        );
+    }
+    assert!(reset, "a reset from the restored address must be recognised");
 }
 
 /// Verify that stateless resets are rate-limited
@@ -1288,6 +1351,208 @@ fn migration() {
         client_stats_after_migrate.frame_tx.immediate_ack
             - client_stats_after_connect.frame_tx.immediate_ack,
         1
+    );
+}
+
+/// A server restricted to same-IP migration follows a client whose port changes, and carries the
+/// path state over even though the address is not an IPv4 literal: the congestion controller the
+/// application installed must survive the rebinding.
+#[test]
+fn migration_same_ip_only_follows_port_rebinding() {
+    let _guard = subscribe();
+    let mut server_config = server_config();
+    server_config.migration_same_ip_only(true);
+    let mut pair = Pair::new(Default::default(), server_config);
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    // The default factory builds Cubic; install BBR so a reset path is distinguishable.
+    let mtu = pair.server_conn_mut(server_ch).stats().path.current_mtu;
+    let bbr = congestion::ControllerFactory::build(
+        Arc::new(congestion::BbrConfig::default()),
+        pair.time,
+        mtu,
+    );
+    pair.server_conn_mut(server_ch).set_congestion_controller(bbr);
+
+    let old = pair.client.addr;
+    pair.client.addr = SocketAddr::new(old.ip(), CLIENT_PORTS.lock().unwrap().next().unwrap());
+    assert!(!old.is_ipv4(), "the test must exercise a non-IPv4 literal");
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive();
+
+    assert_eq!(
+        pair.server_conn_mut(server_ch).remote_address(),
+        pair.client.addr
+    );
+    assert!(
+        pair.server_conn_mut(server_ch)
+            .congestion_state()
+            .clone_box()
+            .into_any()
+            .downcast::<congestion::Bbr>()
+            .is_ok(),
+        "port rebinding must not replace the installed congestion controller"
+    );
+}
+
+/// Connect a client that starts at `start`, move it to `moved` and report whether the server
+/// processed anything from the new address.
+fn same_ip_only_roam(start: IpAddr, moved: SocketAddr) -> bool {
+    let mut server_config = server_config();
+    server_config.migration_same_ip_only(true);
+    let mut pair = Pair::new(Default::default(), server_config);
+    pair.client.addr = SocketAddr::new(start, pair.client.addr.port());
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    let old = pair.client.addr;
+    assert_eq!(pair.server_conn_mut(server_ch).remote_address(), old);
+    let rx_before = pair.server_conn_mut(server_ch).stats().udp_rx.datagrams;
+    pair.client.addr = moved;
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    pair.drive_server();
+    let seen = pair.server_conn_mut(server_ch).stats().udp_rx.datagrams > rx_before;
+    assert_eq!(
+        seen,
+        pair.server_conn_mut(server_ch).remote_address() == moved,
+        "a datagram is either dropped unseen or followed"
+    );
+
+    if !seen {
+        // The connection is still usable from the address the server knows.
+        pair.client.addr = old;
+        pair.client_conn_mut(client_ch).ping();
+        pair.drive_client();
+        pair.drive_server();
+        assert!(pair.server_conn_mut(server_ch).stats().udp_rx.datagrams > rx_before);
+        assert_eq!(pair.server_conn_mut(server_ch).remote_address(), old);
+    }
+    seen
+}
+
+/// A server restricted to same-IP migration ignores datagrams from a different IP, exactly as if
+/// migration were disabled: across families, within a family, between v4-mapped addresses and
+/// between scopes of one link-local address.
+#[test]
+fn migration_same_ip_only_drops_other_ip() {
+    let _guard = subscribe();
+    let v6: IpAddr = Ipv6Addr::LOCALHOST.into();
+    let mapped: IpAddr = Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped().into();
+    let other_mapped: IpAddr = Ipv4Addr::new(10, 0, 0, 2).to_ipv6_mapped().into();
+    let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+
+    assert!(!same_ip_only_roam(v6, (Ipv4Addr::LOCALHOST, 4433).into()));
+    assert!(!same_ip_only_roam(
+        v6,
+        (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2), 4433).into()
+    ));
+    assert!(!same_ip_only_roam(mapped, SocketAddr::new(other_mapped, 4433)));
+    assert!(!same_ip_only_roam(
+        Ipv4Addr::new(10, 0, 0, 1).into(),
+        (Ipv4Addr::new(10, 0, 0, 2), 4433).into()
+    ));
+    assert!(!same_ip_only_roam(
+        link_local.into(),
+        SocketAddrV6::new(link_local, 4433, 0, 7).into()
+    ));
+    // Same host, other port: followed, for a v4-mapped address too.
+    assert!(same_ip_only_roam(mapped, SocketAddr::new(mapped, 4433)));
+    assert!(same_ip_only_roam(v6, SocketAddr::new(v6, 4433)));
+}
+
+/// The application's filter sees the current and the candidate address and can veto a migration
+/// that the same-IP rule would allow; a vetoed datagram is dropped before any processing.
+#[test]
+fn migration_filter_vetoes_before_processing() {
+    let _guard = subscribe();
+    const DENIED_PORT: u16 = 4433;
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let mut server_config = server_config();
+    server_config.migration_same_ip_only(true);
+    let log = asked.clone();
+    server_config.migration_filter(Some(Arc::new(move |current, new: SocketAddr| {
+        log.lock().unwrap().push((current, new));
+        new.port() != DENIED_PORT
+    })));
+    let mut pair = Pair::new(Default::default(), server_config);
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+    assert!(asked.lock().unwrap().is_empty(), "the current path is not a migration");
+
+    let old = pair.client.addr;
+    let rx_before = pair.server_conn_mut(server_ch).stats().udp_rx.datagrams;
+    let denied = SocketAddr::new(old.ip(), DENIED_PORT);
+    pair.client.addr = denied;
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    pair.drive_server();
+    assert_eq!(pair.server_conn_mut(server_ch).remote_address(), old);
+    assert_eq!(
+        pair.server_conn_mut(server_ch).stats().udp_rx.datagrams,
+        rx_before
+    );
+    assert_eq!(asked.lock().unwrap().first(), Some(&(old, denied)));
+
+    let allowed = SocketAddr::new(old.ip(), DENIED_PORT + 1);
+    pair.client.addr = allowed;
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive();
+    assert_eq!(pair.server_conn_mut(server_ch).remote_address(), allowed);
+}
+
+/// A controller installed while a migration is still unvalidated must survive the fallback to the
+/// previous path when validation fails.
+#[test]
+fn congestion_controller_set_during_migration_survives_fallback() {
+    let _guard = subscribe();
+    let mut server_config = server_config();
+    server_config.migration_same_ip_only(true);
+    let mut pair = Pair::new(Default::default(), server_config);
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    let old = pair.client.addr;
+    let moved = SocketAddr::new(old.ip(), CLIENT_PORTS.lock().unwrap().next().unwrap());
+    pair.client.addr = moved;
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    pair.drive_server();
+    assert_eq!(pair.server_conn_mut(server_ch).remote_address(), moved);
+
+    let mtu = pair.server_conn_mut(server_ch).stats().path.current_mtu;
+    let bbr = congestion::ControllerFactory::build(
+        Arc::new(congestion::BbrConfig::default()),
+        pair.time,
+        mtu,
+    );
+    pair.server_conn_mut(server_ch).set_congestion_controller(bbr);
+
+    // The client never answers the challenge: run the server alone until it gives up.
+    for _ in 0..200 {
+        pair.client.inbound.clear();
+        if pair.server_conn_mut(server_ch).remote_address() == old {
+            break;
+        }
+        if let Some(t) = pair.server.next_wakeup() {
+            pair.time = pair.time.max(t);
+        }
+        pair.drive_server();
+    }
+    assert_eq!(
+        pair.server_conn_mut(server_ch).remote_address(),
+        old,
+        "failed validation must fall back to the previous path"
+    );
+    assert!(
+        pair.server_conn_mut(server_ch)
+            .congestion_state()
+            .clone_box()
+            .into_any()
+            .downcast::<congestion::Bbr>()
+            .is_ok(),
+        "the fallback path must keep the controller installed during the migration"
     );
 }
 

@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    net::{SocketAddrV4, SocketAddrV6},
+    net::{SocketAddr, SocketAddrV4, SocketAddrV6},
     num::TryFromIntError,
     sync::Arc,
 };
@@ -218,6 +218,12 @@ pub struct ServerConfig {
     /// rebinding. Enabled by default.
     pub(crate) migration: bool,
 
+    /// Restrict migration to address changes that keep the peer's IP (NAT port rebinding)
+    pub(crate) migration_same_ip_only: bool,
+
+    /// Application veto over a migration, called with the current and the candidate address
+    pub(crate) migration_filter: Option<Arc<MigrationFilter>>,
+
     pub(crate) preferred_address_v4: Option<SocketAddrV4>,
     pub(crate) preferred_address_v6: Option<SocketAddrV6>,
 
@@ -227,6 +233,9 @@ pub struct ServerConfig {
 
     pub(crate) time_source: Arc<dyn TimeSource>,
 }
+
+/// Decides whether a connection may move from its current address (first argument) to a new one
+pub type MigrationFilter = dyn Fn(SocketAddr, SocketAddr) -> bool + Send + Sync;
 
 impl ServerConfig {
     /// Create a default config with a particular handshake token key
@@ -242,6 +251,8 @@ impl ServerConfig {
             retry_token_lifetime: Duration::from_secs(15),
 
             migration: true,
+            migration_same_ip_only: false,
+            migration_filter: None,
 
             validation_token: ValidationTokenConfig::default(),
 
@@ -291,6 +302,31 @@ impl ServerConfig {
     /// rebinding. Enabled by default.
     pub fn migration(&mut self, value: bool) -> &mut Self {
         self.migration = value;
+        self
+    }
+
+    /// Whether migration is restricted to address changes that keep the client's IP
+    ///
+    /// When set, a client may only move to a different port on the IP it is currently using, as
+    /// happens on NAT rebinding; datagrams arriving from any other IP are dropped as if migration
+    /// were disabled. Decisions an application made about the client's IP therefore stay valid
+    /// for the lifetime of the connection. Has no effect unless [`migration`](Self::migration) is
+    /// enabled. Disabled by default.
+    pub fn migration_same_ip_only(&mut self, value: bool) -> &mut Self {
+        self.migration_same_ip_only = value;
+        self
+    }
+
+    /// Let the application veto a migration before any packet from the new address is processed
+    ///
+    /// The filter is called with the address the connection currently uses and the address a
+    /// datagram for it arrived from, for every datagram whose source differs from the current
+    /// one. Returning `false` drops the datagram as if migration were disabled. It runs before
+    /// the datagram is decrypted, so it must be cheap and must not assume the sender is the
+    /// peer. Applied in addition to [`migration_same_ip_only`](Self::migration_same_ip_only).
+    /// Has no effect unless [`migration`](Self::migration) is enabled. Unset by default.
+    pub fn migration_filter(&mut self, filter: Option<Arc<MigrationFilter>>) -> &mut Self {
+        self.migration_filter = filter;
         self
     }
 
@@ -418,6 +454,8 @@ impl fmt::Debug for ServerConfig {
             .field("retry_token_lifetime", &self.retry_token_lifetime)
             .field("validation_token", &self.validation_token)
             .field("migration", &self.migration)
+            .field("migration_same_ip_only", &self.migration_same_ip_only)
+            .field("migration_filter", &self.migration_filter.is_some())
             .field("preferred_address_v4", &self.preferred_address_v4)
             .field("preferred_address_v6", &self.preferred_address_v6)
             .field("max_incoming", &self.max_incoming)
