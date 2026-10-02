@@ -1396,6 +1396,94 @@ fn migration_same_ip_only_follows_port_rebinding() {
     );
 }
 
+/// A congestion controller the application installed follows the connection to another IP. The
+/// path itself is new, so without this the server would fall back to the configured factory.
+#[test]
+fn migration_to_another_ip_keeps_app_congestion_controller() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    // The default factory builds Cubic; install BBR so a reset path is distinguishable.
+    let mtu = pair.server_conn_mut(server_ch).stats().path.current_mtu;
+    let bbr = congestion::ControllerFactory::build(
+        Arc::new(congestion::BbrConfig::default()),
+        pair.time,
+        mtu,
+    );
+    pair.server_conn_mut(server_ch).set_congestion_controller(bbr);
+
+    let old = pair.client.addr;
+    let moved = SocketAddr::new(
+        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9).into(),
+        old.port(),
+    );
+    assert_ne!(old.ip(), moved.ip());
+    pair.client.addr = moved;
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive();
+
+    assert_eq!(pair.server_conn_mut(server_ch).remote_address(), moved);
+    assert!(
+        pair.server_conn_mut(server_ch)
+            .congestion_state()
+            .clone_box()
+            .into_any()
+            .downcast::<congestion::Bbr>()
+            .is_ok(),
+        "migrating to another IP must not replace the installed congestion controller"
+    );
+}
+
+/// Rebinding the port on the same host keeps the path state for every address form — not only
+/// IPv4 literals: v4-mapped addresses from a dual-stack socket, and native IPv6.
+#[test]
+fn migration_same_host_port_rebinding_keeps_path_state() {
+    let _guard = subscribe();
+    let mapped: IpAddr = Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped().into();
+    let native: IpAddr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7).into();
+    for ip in [mapped, native] {
+        let mut pair = Pair::default();
+        pair.client.addr = SocketAddr::new(ip, pair.client.addr.port());
+        let (client_ch, server_ch) = pair.connect();
+        pair.drive();
+        let mtu = pair.server_conn_mut(server_ch).stats().path.current_mtu;
+        assert!(mtu > 1200, "the test needs a discovered MTU to tell a fresh path apart");
+
+        pair.client.addr = SocketAddr::new(ip, CLIENT_PORTS.lock().unwrap().next().unwrap());
+        pair.client_conn_mut(client_ch).ping();
+        pair.drive_client();
+        pair.drive_server();
+        assert_eq!(pair.server_conn_mut(server_ch).remote_address(), pair.client.addr);
+        assert_eq!(
+            pair.server_conn_mut(server_ch).stats().path.current_mtu,
+            mtu,
+            "{ip}: a port rebinding must not restart the path"
+        );
+    }
+}
+
+/// Moving to another host does start a new path.
+#[test]
+fn migration_to_another_ip_restarts_path_state() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+    let mtu = pair.server_conn_mut(server_ch).stats().path.current_mtu;
+    assert!(mtu > 1200);
+    pair.client.addr = SocketAddr::new(
+        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9).into(),
+        pair.client.addr.port(),
+    );
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    pair.drive_server();
+    assert_eq!(pair.server_conn_mut(server_ch).remote_address(), pair.client.addr);
+    assert!(pair.server_conn_mut(server_ch).stats().path.current_mtu < mtu);
+}
+
 /// Connect a client that starts at `start`, move it to `moved` and report whether the server
 /// processed anything from the new address.
 fn same_ip_only_roam(start: IpAddr, moved: SocketAddr) -> bool {

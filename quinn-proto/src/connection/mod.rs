@@ -150,6 +150,11 @@ pub struct Connection {
     /// Whether MTU detection is supported in this environment
     allow_mtud: bool,
     prev_path: Option<(ConnectionId, PathData)>,
+    /// Whether the application replaced the congestion controller
+    ///
+    /// Such a controller follows the connection across migrations instead of being reset to the
+    /// configured factory's default.
+    app_congestion: bool,
     state: State,
     side: ConnectionSide,
     /// Whether or not 0-RTT was enabled during the handshake. Does not imply acceptance.
@@ -287,6 +292,7 @@ impl Connection {
             allow_mtud,
             local_ip,
             prev_path: None,
+            app_congestion: false,
             state,
             side: connection_side,
             zero_rtt_enabled: false,
@@ -1406,6 +1412,10 @@ impl Connection {
     /// Replaces only the controller object on the primary path; RTT and MTU state are left
     /// unchanged. The caller should construct `controller` from `current_mtu` and existing
     /// estimates.
+    ///
+    /// The controller stays with the connection when the peer migrates to another host: the new
+    /// path starts from fresh RTT and MTU state but gets a clone of this controller, told the
+    /// new path's MTU, rather than the configured factory's default.
     pub fn set_congestion_controller(&mut self, controller: Box<dyn Controller>) {
         // A migration may still be unvalidated; if it fails the connection falls back to the
         // previous path, which must not resurrect the controller this call replaces.
@@ -1413,6 +1423,7 @@ impl Connection {
             prev.congestion = controller.clone_box();
         }
         self.path.congestion = controller;
+        self.app_congestion = true;
     }
 
     /// Resets path-specific settings.
@@ -3087,30 +3098,29 @@ impl Connection {
         // Note that the congestion window will not grow until validation terminates. Helps mitigate
         // amplification attacks performed by spoofing source addresses.
         //
-        // Upstream only trusts the same-IP heuristic for IPv4. A server restricted to same-IP
-        // migration has every migration be a rebinding by construction, including IPv4 peers that
-        // a dual-stack socket reports as v4-mapped IPv6; keep the path state (and any congestion
-        // controller the application installed) for those too.
-        let same_ip_only = matches!(
-            self.side,
-            ConnectionSide::Server { ref server_config } if server_config.migration_same_ip_only
-        );
-        let mut new_path = if (remote.is_ipv4() || same_ip_only)
-            && same_host(self.path.remote, remote)
-        {
+        // Upstream only trusts the same-IP heuristic for IPv4 literals. Here every rebinding on
+        // the same host keeps the path state (and any congestion controller the application
+        // installed): IPv4 peers behind a dual-stack socket arrive as v4-mapped IPv6, and an
+        // IPv6 host changing only its source port is still the same network path.
+        let mut new_path = if same_host(self.path.remote, remote) {
             PathData::from_previous(remote, &self.path, self.path_counter, now)
         } else {
             let peer_max_udp_payload_size =
                 u16::try_from(self.peer_params.max_udp_payload_size.into_inner())
                     .unwrap_or(u16::MAX);
-            PathData::new(
+            let mut path = PathData::new(
                 remote,
                 self.allow_mtud,
                 Some(peer_max_udp_payload_size),
                 self.path_counter,
                 now,
                 &self.config,
-            )
+            );
+            if self.app_congestion {
+                path.congestion = self.path.congestion.clone_box();
+                path.congestion.on_mtu_update(path.current_mtu());
+            }
+            path
         };
         new_path.challenge = Some(self.rng.random());
         new_path.challenge_pending = true;

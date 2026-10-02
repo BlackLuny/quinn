@@ -751,6 +751,60 @@ async fn rebind_recv() {
     server.await.unwrap();
 }
 
+/// The server's address watch reports the address a client rebinds to, and agrees with
+/// `remote_address`.
+#[tokio::test]
+async fn remote_address_watch_reports_migration() {
+    let _guard = subscribe();
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+    let cert = CertificateDer::from(cert.cert);
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.clone()).unwrap();
+
+    let mut client = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+    client.set_default_client_config(
+        ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+    );
+    let server_config =
+        crate::ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
+    let server = Endpoint::server(
+        server_config,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+    )
+    .unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    let accept = tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() });
+    let client_conn = client
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let server_conn = accept.await.unwrap();
+
+    let before = client.local_addr().unwrap();
+    let mut watch = server_conn.remote_address_watch();
+    assert_eq!(*watch.borrow_and_update(), before);
+    assert_eq!(server_conn.remote_address(), before);
+
+    client
+        .rebind(UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap())
+        .unwrap();
+    let after = client.local_addr().unwrap();
+    assert_ne!(before, after);
+    let mut stream = client_conn.open_uni().await.unwrap();
+    stream.write_all(b"moved").await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), watch.changed())
+        .await
+        .expect("the watch must report the migration")
+        .unwrap();
+    assert_eq!(*watch.borrow_and_update(), after);
+    assert_eq!(server_conn.remote_address(), after);
+}
+
 #[tokio::test]
 async fn stream_id_flow_control() {
     let _guard = subscribe();

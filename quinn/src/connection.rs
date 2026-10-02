@@ -16,7 +16,7 @@ use bytes::Bytes;
 use pin_project_lite::pin_project;
 use rustc_hash::FxHashMap;
 use thiserror::Error;
-use tokio::sync::{Notify, futures::Notified, mpsc, oneshot};
+use tokio::sync::{Notify, futures::Notified, mpsc, oneshot, watch};
 use tracing::{Instrument, Span, debug_span};
 
 use crate::{
@@ -252,10 +252,15 @@ impl Future for ConnectionDriver {
             conn.terminate(e, &self.0.shared);
             return Poll::Ready(Ok(()));
         }
+        // Publish before anything below can return early, and again once timers have run: for
+        // a connection that is still being driven, the watched address equals
+        // `remote_address()` whenever this poll is not running.
+        conn.publish_remote();
         let mut keep_going = conn.drive_transmit(cx)?;
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
+        conn.publish_remote();
         conn.forward_endpoint_events();
         conn.forward_app_events(&self.0.shared);
 
@@ -513,6 +518,16 @@ impl Connection {
     /// switching to a cellular internet connection.
     pub fn remote_address(&self) -> SocketAddr {
         self.0.state.lock("remote_address").inner.remote_address()
+    }
+
+    /// Watch the peer's UDP address
+    ///
+    /// The watched value is updated whenever [`remote_address`](Self::remote_address) changes:
+    /// when the peer migrates, and when a migration fails validation and the connection falls
+    /// back to the previous path. A migration is reported as soon as the connection switches to
+    /// the new address, before that address has been validated.
+    pub fn remote_address_watch(&self) -> watch::Receiver<SocketAddr> {
+        self.0.state.lock("remote_address_watch").remote.subscribe()
     }
 
     /// The local IP address which was used when the peer established
@@ -912,12 +927,13 @@ impl ConnectionRef {
     ) -> Self {
         Self(Arc::new(ConnectionInner {
             state: Mutex::new(State {
-                inner: conn,
                 driver: None,
                 handle,
                 on_handshake_data: Some(on_handshake_data),
                 on_connected: Some(on_connected),
                 connected: false,
+                remote: watch::channel(conn.remote_address()).0,
+                inner: conn,
                 timer: None,
                 timer_deadline: None,
                 conn_events,
@@ -1000,6 +1016,8 @@ pub(crate) struct State {
     on_handshake_data: Option<oneshot::Sender<()>>,
     on_connected: Option<oneshot::Sender<bool>>,
     connected: bool,
+    /// Last peer address reported to [`Connection::remote_address_watch`] subscribers
+    remote: watch::Sender<SocketAddr>,
     timer: Option<Pin<Box<dyn AsyncTimer>>>,
     timer_deadline: Option<Instant>,
     conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
@@ -1124,6 +1142,16 @@ impl State {
                 }
             }
         }
+    }
+
+    /// Tell address watchers where the peer is now, if incoming packets or a timer moved it
+    fn publish_remote(&mut self) {
+        let remote = self.inner.remote_address();
+        self.remote.send_if_modified(|published| {
+            let changed = *published != remote;
+            *published = remote;
+            changed
+        });
     }
 
     fn forward_app_events(&mut self, shared: &Shared) {
