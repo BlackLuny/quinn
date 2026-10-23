@@ -163,6 +163,7 @@ impl Endpoint {
             Ok((first_decode, remaining)) => DatagramConnectionEvent {
                 now,
                 remote,
+                local_ip,
                 ecn,
                 first_decode,
                 remaining,

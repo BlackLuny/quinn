@@ -36,6 +36,7 @@ mod util;
 use util::*;
 
 mod token;
+mod migration_path;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen_test::wasm_bindgen_test as test;

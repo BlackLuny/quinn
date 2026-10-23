@@ -530,8 +530,9 @@ impl Connection {
         self.0.state.lock("remote_address_watch").remote.subscribe()
     }
 
-    /// The local IP address which was used when the peer established
-    /// the connection
+    /// The local IP address used by the current network path
+    ///
+    /// This follows authenticated peer migration and is restored on path-validation fallback.
     ///
     /// This can be different from the address the endpoint is bound to, in case
     /// the endpoint is bound to a wildcard address like `0.0.0.0` or `::`.
