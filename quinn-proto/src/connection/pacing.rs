@@ -203,7 +203,10 @@ fn optimal_capacity(smoothed_rtt: Duration, window: u64, mtu: u16) -> u64 {
 /// already permits, so this is not a new burstiness.
 fn rate_capacity(rate_bytes_per_s: u64, mtu: u16) -> u64 {
     let capacity = ((u128::from(rate_bytes_per_s) * BURST_INTERVAL_NANOS) / NANOS_PER_SEC) as u64;
-    capacity.clamp(MIN_BURST_SIZE * u64::from(mtu), MAX_BURST_SIZE * u64::from(mtu))
+    capacity.clamp(
+        MIN_BURST_SIZE * u64::from(mtu),
+        MAX_BURST_SIZE * u64::from(mtu),
+    )
 }
 
 const NANOS_PER_SEC: u128 = 1_000_000_000;
@@ -244,7 +247,14 @@ mod tests {
         );
         assert!(
             Pacer::new(rtt, 30000, 1500, new_instant)
-                .delay(Duration::from_micros(0), 1500, 1500, 3000, None, old_instant)
+                .delay(
+                    Duration::from_micros(0),
+                    1500,
+                    1500,
+                    3000,
+                    None,
+                    old_instant
+                )
                 .is_none()
         );
     }
@@ -309,9 +319,11 @@ mod tests {
 
         let mut pacer = Pacer::new(rtt, window, mtu, now);
         assert_eq!(pacer.capacity, optimal_capacity(rtt, window, mtu));
-        assert!(pacer
-            .delay(rtt, u64::from(mtu), mtu, window, Some(0), now)
-            .is_none());
+        assert!(
+            pacer
+                .delay(rtt, u64::from(mtu), mtu, window, Some(0), now)
+                .is_none()
+        );
         assert_eq!(pacer.capacity, optimal_capacity(rtt, window, mtu));
         assert_eq!(pacer.last_rate, None);
     }

@@ -75,7 +75,9 @@ use spaces::Retransmits;
 use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
 mod stats;
-pub use stats::{ConnectionStats, FlowControlStats, FrameStats, PathStats, ReceiveStreamStats, UdpStats};
+pub use stats::{
+    ConnectionStats, FlowControlStats, FrameStats, PathStats, ReceiveStreamStats, UdpStats,
+};
 
 mod streams;
 #[cfg(fuzzing)]
@@ -852,7 +854,9 @@ impl Connection {
             // Send an off-path PATH_RESPONSE. Prioritized over on-path data to ensure that path
             // validation can occur while the link is saturated.
             if space_id == SpaceId::Data && num_datagrams == 1 {
-                if let Some((token, remote, local_ip)) = self.path_responses.pop_off_path(self.path.remote) {
+                if let Some((token, remote, local_ip)) =
+                    self.path_responses.pop_off_path(self.path.remote)
+                {
                     // `unwrap` guaranteed to succeed because `builder_storage` was populated just
                     // above.
                     let mut builder = builder_storage.take().unwrap();
@@ -1290,7 +1294,8 @@ impl Connection {
     /// Increase the per-stream receive window. Decreases are ignored.
     /// Open streams receive credit immediately; future streams on their first read.
     pub fn set_stream_receive_window(&mut self, window: VarInt) {
-        self.streams.set_stream_receive_window(window, &mut self.spaces[SpaceId::Data].pending);
+        self.streams
+            .set_stream_receive_window(window, &mut self.spaces[SpaceId::Data].pending);
     }
 
     /// Ping the remote endpoint
@@ -2283,7 +2288,14 @@ impl Connection {
             self.zero_rtt_crypto.as_ref(),
             self.peer_params.stateless_reset_token,
         ) {
-            self.handle_packet(now, remote, local_ip, ecn, decoded.packet, decoded.stateless_reset);
+            self.handle_packet(
+                now,
+                remote,
+                local_ip,
+                ecn,
+                decoded.packet,
+                decoded.stateless_reset,
+            );
         }
     }
 
@@ -2452,7 +2464,9 @@ impl Connection {
         let state = match self.state {
             State::Established => {
                 match packet.header.space() {
-                    SpaceId::Data => self.process_payload(now, remote, local_ip, number.unwrap(), packet)?,
+                    SpaceId::Data => {
+                        self.process_payload(now, remote, local_ip, number.unwrap(), packet)?
+                    }
                     _ if packet.header.has_frames() => self.process_early_payload(now, packet)?,
                     _ => {
                         trace!("discarding unexpected pre-handshake packet");

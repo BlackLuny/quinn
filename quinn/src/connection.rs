@@ -679,7 +679,11 @@ impl Connection {
 
     /// Delivery counters for active receive streams. Scans live stream state.
     pub fn receive_stream_stats(&self) -> Vec<proto::ReceiveStreamStats> {
-        self.0.state.lock("receive_stream_stats").inner.receive_stream_stats()
+        self.0
+            .state
+            .lock("receive_stream_stats")
+            .inner
+            .receive_stream_stats()
     }
 
     /// Modify the number of remotely initiated bidirectional streams that may be concurrently open

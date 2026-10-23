@@ -45,9 +45,9 @@ pub use bloom_token_log::BloomTokenLog;
 mod connection;
 pub use crate::connection::{
     Chunk, Chunks, ClosedStream, Connection, ConnectionError, ConnectionStats, Datagrams, Event,
-    FinishError, FlowControlStats, FrameStats, PathStats, ReceiveStreamStats, ReadError, ReadableError, RecvStream, RttEstimator,
-    SendDatagramError, SendStream, ShouldTransmit, StreamEvent, Streams, UdpStats, WriteError,
-    Written,
+    FinishError, FlowControlStats, FrameStats, PathStats, ReadError, ReadableError,
+    ReceiveStreamStats, RecvStream, RttEstimator, SendDatagramError, SendStream, ShouldTransmit,
+    StreamEvent, Streams, UdpStats, WriteError, Written,
 };
 #[cfg(feature = "qlog")]
 pub use connection::qlog::QlogStream;
@@ -59,8 +59,8 @@ mod config;
 #[cfg(feature = "qlog")]
 pub use config::QlogConfig;
 pub use config::{
-    AckFrequencyConfig, ClientConfig, ConfigError, EndpointConfig, IdleTimeout, MtuDiscoveryConfig,
-    MigrationFilter, ServerConfig, StdSystemTime, TimeSource, TransportConfig,
+    AckFrequencyConfig, ClientConfig, ConfigError, EndpointConfig, IdleTimeout, MigrationFilter,
+    MtuDiscoveryConfig, ServerConfig, StdSystemTime, TimeSource, TransportConfig,
     ValidationTokenConfig,
 };
 

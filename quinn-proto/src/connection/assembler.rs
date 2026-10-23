@@ -227,7 +227,11 @@ impl Assembler {
     /// An ordered reader cannot progress because the next available chunk follows a gap.
     /// Contiguous data waiting for a slow application is deliberately excluded.
     pub(super) fn read_blocked_on_gap(&self) -> bool {
-        self.state.is_ordered() && self.data.peek().is_some_and(|chunk| chunk.offset > self.bytes_read)
+        self.state.is_ordered()
+            && self
+                .data
+                .peek()
+                .is_some_and(|chunk| chunk.offset > self.bytes_read)
     }
 
     /// Discard all buffered data

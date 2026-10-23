@@ -1,4 +1,7 @@
-use std::{fmt, net::{IpAddr, SocketAddr}};
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
 
 use bytes::{Buf, BufMut, BytesMut};
 

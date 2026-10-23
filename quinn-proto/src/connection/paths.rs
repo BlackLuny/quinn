@@ -1,4 +1,7 @@
-use std::{cmp, net::{IpAddr, SocketAddr}};
+use std::{
+    cmp,
+    net::{IpAddr, SocketAddr},
+};
 
 use tracing::trace;
 
@@ -365,7 +368,13 @@ pub(crate) struct PathResponses {
 }
 
 impl PathResponses {
-    pub(crate) fn push(&mut self, packet: u64, token: u64, remote: SocketAddr, local_ip: Option<IpAddr>) {
+    pub(crate) fn push(
+        &mut self,
+        packet: u64,
+        token: u64,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+    ) {
         /// Arbitrary permissive limit to prevent abuse
         const MAX_PATH_RESPONSES: usize = 16;
         let response = PathResponse {
@@ -391,7 +400,10 @@ impl PathResponses {
         }
     }
 
-    pub(crate) fn pop_off_path(&mut self, remote: SocketAddr) -> Option<(u64, SocketAddr, Option<IpAddr>)> {
+    pub(crate) fn pop_off_path(
+        &mut self,
+        remote: SocketAddr,
+    ) -> Option<(u64, SocketAddr, Option<IpAddr>)> {
         let response = *self.pending.last()?;
         if response.remote == remote {
             // We don't bother searching further because we expect that the on-path response will
