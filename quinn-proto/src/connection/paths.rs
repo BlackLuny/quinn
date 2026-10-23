@@ -1,4 +1,7 @@
-use std::{cmp, net::SocketAddr};
+use std::{
+    cmp,
+    net::{IpAddr, SocketAddr},
+};
 
 use tracing::trace;
 
@@ -15,6 +18,8 @@ use qlog::events::quic::MetricsUpdated;
 /// Description of a particular network path
 pub(super) struct PathData {
     pub(super) remote: SocketAddr,
+    /// Local destination of the authenticated packet that established this path.
+    pub(super) local_ip: Option<IpAddr>,
     pub(super) rtt: RttEstimator,
     /// Whether we're enabling ECN on outgoing packets
     pub(super) sending_ecn: bool,
@@ -57,6 +62,7 @@ pub(super) struct PathData {
 impl PathData {
     pub(super) fn new(
         remote: SocketAddr,
+        local_ip: Option<IpAddr>,
         allow_mtud: bool,
         peer_max_udp_payload_size: Option<u16>,
         generation: u64,
@@ -69,6 +75,7 @@ impl PathData {
             .build(now, config.get_initial_mtu());
         Self {
             remote,
+            local_ip,
             rtt: RttEstimator::new(config.initial_rtt),
             sending_ecn: true,
             pacing: Pacer::new(
@@ -109,6 +116,7 @@ impl PathData {
 
     pub(super) fn from_previous(
         remote: SocketAddr,
+        local_ip: Option<IpAddr>,
         prev: &Self,
         generation: u64,
         now: Instant,
@@ -117,6 +125,7 @@ impl PathData {
         let smoothed_rtt = prev.rtt.get();
         Self {
             remote,
+            local_ip,
             rtt: prev.rtt,
             pacing: Pacer::new(smoothed_rtt, congestion.window(), prev.current_mtu(), now),
             sending_ecn: true,
@@ -359,13 +368,20 @@ pub(crate) struct PathResponses {
 }
 
 impl PathResponses {
-    pub(crate) fn push(&mut self, packet: u64, token: u64, remote: SocketAddr) {
+    pub(crate) fn push(
+        &mut self,
+        packet: u64,
+        token: u64,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+    ) {
         /// Arbitrary permissive limit to prevent abuse
         const MAX_PATH_RESPONSES: usize = 16;
         let response = PathResponse {
             packet,
             token,
             remote,
+            local_ip,
         };
         let existing = self.pending.iter_mut().find(|x| x.remote == remote);
         if let Some(existing) = existing {
@@ -384,7 +400,10 @@ impl PathResponses {
         }
     }
 
-    pub(crate) fn pop_off_path(&mut self, remote: SocketAddr) -> Option<(u64, SocketAddr)> {
+    pub(crate) fn pop_off_path(
+        &mut self,
+        remote: SocketAddr,
+    ) -> Option<(u64, SocketAddr, Option<IpAddr>)> {
         let response = *self.pending.last()?;
         if response.remote == remote {
             // We don't bother searching further because we expect that the on-path response will
@@ -392,7 +411,7 @@ impl PathResponses {
             return None;
         }
         self.pending.pop();
-        Some((response.token, response.remote))
+        Some((response.token, response.remote, response.local_ip))
     }
 
     pub(crate) fn pop_on_path(&mut self, remote: SocketAddr) -> Option<u64> {
@@ -418,6 +437,7 @@ struct PathResponse {
     token: u64,
     /// The address the corresponding PATH_CHALLENGE was received from
     remote: SocketAddr,
+    local_ip: Option<IpAddr>,
 }
 
 /// Summary statistics of packets that have been sent on a particular path, but which have not yet

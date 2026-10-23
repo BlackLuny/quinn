@@ -35,6 +35,7 @@ use crate::{
 mod util;
 use util::*;
 
+mod migration_path;
 mod token;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -307,7 +308,10 @@ fn client_stateless_reset_after_failed_migration() {
             }
         );
     }
-    assert!(reset, "a reset from the restored address must be recognised");
+    assert!(
+        reset,
+        "a reset from the restored address must be recognised"
+    );
 }
 
 /// Verify that stateless resets are rate-limited
@@ -1373,7 +1377,8 @@ fn migration_same_ip_only_follows_port_rebinding() {
         pair.time,
         mtu,
     );
-    pair.server_conn_mut(server_ch).set_congestion_controller(bbr);
+    pair.server_conn_mut(server_ch)
+        .set_congestion_controller(bbr);
 
     let old = pair.client.addr;
     pair.client.addr = SocketAddr::new(old.ip(), CLIENT_PORTS.lock().unwrap().next().unwrap());
@@ -1412,7 +1417,8 @@ fn migration_to_another_ip_keeps_app_congestion_controller() {
         pair.time,
         mtu,
     );
-    pair.server_conn_mut(server_ch).set_congestion_controller(bbr);
+    pair.server_conn_mut(server_ch)
+        .set_congestion_controller(bbr);
 
     let old = pair.client.addr;
     let moved = SocketAddr::new(
@@ -1449,13 +1455,19 @@ fn migration_same_host_port_rebinding_keeps_path_state() {
         let (client_ch, server_ch) = pair.connect();
         pair.drive();
         let mtu = pair.server_conn_mut(server_ch).stats().path.current_mtu;
-        assert!(mtu > 1200, "the test needs a discovered MTU to tell a fresh path apart");
+        assert!(
+            mtu > 1200,
+            "the test needs a discovered MTU to tell a fresh path apart"
+        );
 
         pair.client.addr = SocketAddr::new(ip, CLIENT_PORTS.lock().unwrap().next().unwrap());
         pair.client_conn_mut(client_ch).ping();
         pair.drive_client();
         pair.drive_server();
-        assert_eq!(pair.server_conn_mut(server_ch).remote_address(), pair.client.addr);
+        assert_eq!(
+            pair.server_conn_mut(server_ch).remote_address(),
+            pair.client.addr
+        );
         assert_eq!(
             pair.server_conn_mut(server_ch).stats().path.current_mtu,
             mtu,
@@ -1480,7 +1492,10 @@ fn migration_to_another_ip_restarts_path_state() {
     pair.client_conn_mut(client_ch).ping();
     pair.drive_client();
     pair.drive_server();
-    assert_eq!(pair.server_conn_mut(server_ch).remote_address(), pair.client.addr);
+    assert_eq!(
+        pair.server_conn_mut(server_ch).remote_address(),
+        pair.client.addr
+    );
     assert!(pair.server_conn_mut(server_ch).stats().path.current_mtu < mtu);
 }
 
@@ -1536,7 +1551,10 @@ fn migration_same_ip_only_drops_other_ip() {
         v6,
         (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2), 4433).into()
     ));
-    assert!(!same_ip_only_roam(mapped, SocketAddr::new(other_mapped, 4433)));
+    assert!(!same_ip_only_roam(
+        mapped,
+        SocketAddr::new(other_mapped, 4433)
+    ));
     assert!(!same_ip_only_roam(
         Ipv4Addr::new(10, 0, 0, 1).into(),
         (Ipv4Addr::new(10, 0, 0, 2), 4433).into()
@@ -1567,7 +1585,10 @@ fn migration_filter_vetoes_before_processing() {
     let mut pair = Pair::new(Default::default(), server_config);
     let (client_ch, server_ch) = pair.connect();
     pair.drive();
-    assert!(asked.lock().unwrap().is_empty(), "the current path is not a migration");
+    assert!(
+        asked.lock().unwrap().is_empty(),
+        "the current path is not a migration"
+    );
 
     let old = pair.client.addr;
     let rx_before = pair.server_conn_mut(server_ch).stats().udp_rx.datagrams;
@@ -1615,7 +1636,8 @@ fn congestion_controller_set_during_migration_survives_fallback() {
         pair.time,
         mtu,
     );
-    pair.server_conn_mut(server_ch).set_congestion_controller(bbr);
+    pair.server_conn_mut(server_ch)
+        .set_congestion_controller(bbr);
 
     // The client never answers the challenge: run the server alone until it gives up.
     for _ in 0..200 {

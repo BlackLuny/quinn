@@ -1,4 +1,7 @@
-use std::{fmt, net::SocketAddr};
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
 
 use bytes::{Buf, BufMut, BytesMut};
 
@@ -21,6 +24,7 @@ pub(crate) enum ConnectionEventInner {
 pub(crate) struct DatagramConnectionEvent {
     pub(crate) now: Instant,
     pub(crate) remote: SocketAddr,
+    pub(crate) local_ip: Option<IpAddr>,
     pub(crate) ecn: Option<EcnCodepoint>,
     pub(crate) first_decode: PartialDecode,
     pub(crate) remaining: Option<BytesMut>,

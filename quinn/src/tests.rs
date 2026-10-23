@@ -764,9 +764,8 @@ async fn remote_address_watch_reports_migration() {
     roots.add(cert.clone()).unwrap();
 
     let mut client = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
-    client.set_default_client_config(
-        ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
-    );
+    client
+        .set_default_client_config(ClientConfig::with_root_certificates(Arc::new(roots)).unwrap());
     let server_config =
         crate::ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
     let server = Endpoint::server(

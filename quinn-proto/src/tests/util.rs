@@ -287,6 +287,7 @@ impl Default for Pair {
 pub(super) struct TestEndpoint {
     pub(super) endpoint: Endpoint,
     pub(super) addr: SocketAddr,
+    pub(super) local_ip: Option<std::net::IpAddr>,
     socket: Option<UdpSocket>,
     timeout: Option<Instant>,
     pub(super) outbound: VecDeque<(Transmit, Bytes)>,
@@ -331,6 +332,7 @@ impl TestEndpoint {
         Self {
             endpoint,
             addr,
+            local_ip: None,
             socket,
             timeout: None,
             outbound: VecDeque::new(),
@@ -365,9 +367,9 @@ impl TestEndpoint {
 
         while self.inbound.front().is_some_and(|x| x.0 <= now) {
             let (recv_time, ecn, packet) = self.inbound.pop_front().unwrap();
-            if let Some(event) = self
-                .endpoint
-                .handle(recv_time, remote, None, ecn, packet, &mut buf)
+            if let Some(event) =
+                self.endpoint
+                    .handle(recv_time, remote, self.local_ip, ecn, packet, &mut buf)
             {
                 match event {
                     DatagramEvent::NewConnection(incoming) => {

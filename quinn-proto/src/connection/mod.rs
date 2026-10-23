@@ -75,7 +75,9 @@ use spaces::Retransmits;
 use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
 mod stats;
-pub use stats::{ConnectionStats, FlowControlStats, FrameStats, PathStats, ReceiveStreamStats, UdpStats};
+pub use stats::{
+    ConnectionStats, FlowControlStats, FrameStats, PathStats, ReceiveStreamStats, UdpStats,
+};
 
 mod streams;
 #[cfg(fuzzing)]
@@ -139,9 +141,7 @@ pub struct Connection {
     handshake_cid: ConnectionId,
     /// The CID the peer initially chose, for use during the handshake
     rem_handshake_cid: ConnectionId,
-    /// The "real" local IP address which was was used to receive the initial packet.
-    /// This is only populated for the server case, and if known
-    local_ip: Option<IpAddr>,
+    /// Active network path, including its local source address when known.
     path: PathData,
     /// Incremented every time we see a new path
     ///
@@ -287,10 +287,9 @@ impl Connection {
                 now,
                 if pref_addr_cid.is_some() { 2 } else { 1 },
             ),
-            path: PathData::new(remote, allow_mtud, None, 0, now, &config),
+            path: PathData::new(remote, local_ip, allow_mtud, None, 0, now, &config),
             path_counter: 0,
             allow_mtud,
-            local_ip,
             prev_path: None,
             app_congestion: false,
             state,
@@ -855,7 +854,9 @@ impl Connection {
             // Send an off-path PATH_RESPONSE. Prioritized over on-path data to ensure that path
             // validation can occur while the link is saturated.
             if space_id == SpaceId::Data && num_datagrams == 1 {
-                if let Some((token, remote)) = self.path_responses.pop_off_path(self.path.remote) {
+                if let Some((token, remote, local_ip)) =
+                    self.path_responses.pop_off_path(self.path.remote)
+                {
                     // `unwrap` guaranteed to succeed because `builder_storage` was populated just
                     // above.
                     let mut builder = builder_storage.take().unwrap();
@@ -879,7 +880,7 @@ impl Connection {
                         size: buf.len(),
                         ecn: None,
                         segment_size: None,
-                        src_ip: self.local_ip,
+                        src_ip: local_ip,
                     });
                 }
             }
@@ -1012,7 +1013,7 @@ impl Connection {
                 1 => None,
                 _ => Some(segment_size),
             },
-            src_ip: self.local_ip,
+            src_ip: self.path.local_ip,
         })
     }
 
@@ -1027,6 +1028,7 @@ impl Connection {
             .challenge
             .expect("previous path challenge pending without token");
         let destination = prev_path.remote;
+        let local_ip = prev_path.local_ip;
         debug_assert_eq!(
             self.highest_space,
             SpaceId::Data,
@@ -1070,7 +1072,7 @@ impl Connection {
             size: buf.len(),
             ecn: None,
             segment_size: None,
-            src_ip: self.local_ip,
+            src_ip: local_ip,
         })
     }
 
@@ -1102,6 +1104,7 @@ impl Connection {
             Datagram(DatagramConnectionEvent {
                 now,
                 remote,
+                local_ip,
                 ecn,
                 first_decode,
                 remaining,
@@ -1122,7 +1125,7 @@ impl Connection {
                 self.stats.udp_rx.bytes += first_decode.len() as u64;
                 let data_len = first_decode.len();
 
-                self.handle_decode(now, remote, ecn, first_decode);
+                self.handle_decode(now, remote, local_ip, ecn, first_decode);
                 // The current `path` might have changed inside `handle_decode`,
                 // since the packet could have triggered a migration. Make sure
                 // the data received is accounted for the most recent path by accessing
@@ -1131,7 +1134,7 @@ impl Connection {
 
                 if let Some(data) = remaining {
                     self.stats.udp_rx.bytes += data.len() as u64;
-                    self.handle_coalesced(now, remote, ecn, data);
+                    self.handle_coalesced(now, remote, local_ip, ecn, data);
                 }
 
                 self.config.qlog_sink.emit_recovery_metrics(
@@ -1212,6 +1215,7 @@ impl Connection {
                     }
                     self.path.challenge = None;
                     self.path.challenge_pending = false;
+                    self.set_loss_detection_timer(now);
                 }
                 Timer::Pacing => trace!("pacing timer expired"),
                 Timer::PushNewCid => {
@@ -1290,7 +1294,8 @@ impl Connection {
     /// Increase the per-stream receive window. Decreases are ignored.
     /// Open streams receive credit immediately; future streams on their first read.
     pub fn set_stream_receive_window(&mut self, window: VarInt) {
-        self.streams.set_stream_receive_window(window, &mut self.spaces[SpaceId::Data].pending);
+        self.streams
+            .set_stream_receive_window(window, &mut self.spaces[SpaceId::Data].pending);
     }
 
     /// Ping the remote endpoint
@@ -1383,17 +1388,16 @@ impl Connection {
         self.path.remote
     }
 
-    /// The local IP address which was used when the peer established
-    /// the connection
+    /// The local IP address used by the current network path
     ///
     /// This can be different from the address the endpoint is bound to, in case
     /// the endpoint is bound to a wildcard address like `0.0.0.0` or `::`.
     ///
     /// This will return `None` for clients, or when no `local_ip` was passed to
     /// [`Endpoint::handle()`](crate::Endpoint::handle) for the datagrams establishing this
-    /// connection.
+    /// connection or the authenticated packet that initiated its current migration.
     pub fn local_ip(&self) -> Option<IpAddr> {
-        self.local_ip
+        self.path.local_ip
     }
 
     /// Current best estimate of this connection's latency (round-trip-time)
@@ -2054,9 +2058,10 @@ impl Connection {
             false,
         );
 
-        self.process_decrypted_packet(now, remote, Some(packet_number), packet.into())?;
+        let local_ip = self.path.local_ip;
+        self.process_decrypted_packet(now, remote, local_ip, Some(packet_number), packet.into())?;
         if let Some(data) = remaining {
-            self.handle_coalesced(now, remote, ecn, data);
+            self.handle_coalesced(now, remote, local_ip, ecn, data);
         }
 
         self.config.qlog_sink.emit_recovery_metrics(
@@ -2244,6 +2249,7 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        local_ip: Option<IpAddr>,
         ecn: Option<EcnCodepoint>,
         data: BytesMut,
     ) {
@@ -2258,7 +2264,7 @@ impl Connection {
             ) {
                 Ok((partial_decode, rest)) => {
                     remaining = rest;
-                    self.handle_decode(now, remote, ecn, partial_decode);
+                    self.handle_decode(now, remote, local_ip, ecn, partial_decode);
                 }
                 Err(e) => {
                     trace!("malformed header: {}", e);
@@ -2272,6 +2278,7 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        local_ip: Option<IpAddr>,
         ecn: Option<EcnCodepoint>,
         partial_decode: PartialDecode,
     ) {
@@ -2281,7 +2288,14 @@ impl Connection {
             self.zero_rtt_crypto.as_ref(),
             self.peer_params.stateless_reset_token,
         ) {
-            self.handle_packet(now, remote, ecn, decoded.packet, decoded.stateless_reset);
+            self.handle_packet(
+                now,
+                remote,
+                local_ip,
+                ecn,
+                decoded.packet,
+                decoded.stateless_reset,
+            );
         }
     }
 
@@ -2289,6 +2303,7 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        local_ip: Option<IpAddr>,
         ecn: Option<EcnCodepoint>,
         packet: Option<Packet>,
         stateless_reset: bool,
@@ -2386,7 +2401,7 @@ impl Connection {
                         );
                     }
 
-                    self.process_decrypted_packet(now, remote, number, packet)
+                    self.process_decrypted_packet(now, remote, local_ip, number, packet)
                 }
             }
         };
@@ -2442,13 +2457,16 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        local_ip: Option<IpAddr>,
         number: Option<u64>,
         packet: Packet,
     ) -> Result<(), ConnectionError> {
         let state = match self.state {
             State::Established => {
                 match packet.header.space() {
-                    SpaceId::Data => self.process_payload(now, remote, number.unwrap(), packet)?,
+                    SpaceId::Data => {
+                        self.process_payload(now, remote, local_ip, number.unwrap(), packet)?
+                    }
                     _ if packet.header.has_frames() => self.process_early_payload(now, packet)?,
                     _ => {
                         trace!("discarding unexpected pre-handshake packet");
@@ -2674,7 +2692,7 @@ impl Connection {
                 ty: LongType::ZeroRtt,
                 ..
             } => {
-                self.process_payload(now, remote, number.unwrap(), packet)?;
+                self.process_payload(now, remote, local_ip, number.unwrap(), packet)?;
                 Ok(())
             }
             Header::VersionNegotiate { .. } => {
@@ -2759,6 +2777,7 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        local_ip: Option<IpAddr>,
         number: u64,
         packet: Packet,
     ) -> Result<(), TransportError> {
@@ -2832,7 +2851,7 @@ impl Connection {
                     close = Some(reason);
                 }
                 Frame::PathChallenge(token) => {
-                    self.path_responses.push(number, token, remote);
+                    self.path_responses.push(number, token, remote, local_ip);
                     if remote == self.path.remote {
                         // PATH_CHALLENGE on active path, possible off-path packet forwarding
                         // attack. Send a non-probing packet to recover the active path.
@@ -3079,7 +3098,7 @@ impl Connection {
                 server_config.migration,
                 "migration-initiating packets should have been dropped immediately"
             );
-            self.migrate(now, remote);
+            self.migrate(now, remote, local_ip);
             // Break linkability, if possible
             if !self.update_rem_cid() {
                 // No spare CID: the token stays, but the endpoint must look it up at the new address.
@@ -3091,7 +3110,7 @@ impl Connection {
         Ok(())
     }
 
-    fn migrate(&mut self, now: Instant, remote: SocketAddr) {
+    fn migrate(&mut self, now: Instant, remote: SocketAddr, local_ip: Option<IpAddr>) {
         trace!(%remote, "migration initiated");
         self.path_counter = self.path_counter.wrapping_add(1);
         // Reset rtt/congestion state for new path unless it looks like a NAT rebinding.
@@ -3103,13 +3122,14 @@ impl Connection {
         // installed): IPv4 peers behind a dual-stack socket arrive as v4-mapped IPv6, and an
         // IPv6 host changing only its source port is still the same network path.
         let mut new_path = if same_host(self.path.remote, remote) {
-            PathData::from_previous(remote, &self.path, self.path_counter, now)
+            PathData::from_previous(remote, local_ip, &self.path, self.path_counter, now)
         } else {
             let peer_max_udp_payload_size =
                 u16::try_from(self.peer_params.max_udp_payload_size.into_inner())
                     .unwrap_or(u16::MAX);
             let mut path = PathData::new(
                 remote,
+                local_ip,
                 self.allow_mtud,
                 Some(peer_max_udp_payload_size),
                 self.path_counter,
@@ -3140,6 +3160,9 @@ impl Connection {
             Timer::PathValidation,
             now + 3 * cmp::max(self.pto(SpaceId::Data), prev_pto),
         );
+        // The old PTO was computed with the previous path's in-flight packets.
+        // Recompute it before a driver can process timeouts on the fresh path.
+        self.set_loss_detection_timer(now);
     }
 
     /// Handle a change in the local address, i.e. an active migration
