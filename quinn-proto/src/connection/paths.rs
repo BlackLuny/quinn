@@ -374,6 +374,7 @@ impl PathResponses {
         token: u64,
         remote: SocketAddr,
         local_ip: Option<IpAddr>,
+        received_len: usize,
     ) {
         /// Arbitrary permissive limit to prevent abuse
         const MAX_PATH_RESPONSES: usize = 16;
@@ -382,8 +383,12 @@ impl PathResponses {
             token,
             remote,
             local_ip,
+            response_limit: received_len.saturating_mul(3),
         };
-        let existing = self.pending.iter_mut().find(|x| x.remote == remote);
+        let existing = self
+            .pending
+            .iter_mut()
+            .find(|x| x.matches_path(remote, local_ip));
         if let Some(existing) = existing {
             // Update a queued response
             if existing.packet <= packet {
@@ -400,23 +405,46 @@ impl PathResponses {
         }
     }
 
+    pub(crate) fn peek_off_path(
+        &self,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+    ) -> Option<(SocketAddr, Option<IpAddr>, usize)> {
+        let response = self.pending.last()?;
+        (!response.matches_path(remote, local_ip)).then_some((
+            response.remote,
+            response.local_ip,
+            response.response_limit,
+        ))
+    }
+
     pub(crate) fn pop_off_path(
         &mut self,
         remote: SocketAddr,
-    ) -> Option<(u64, SocketAddr, Option<IpAddr>)> {
+        local_ip: Option<IpAddr>,
+    ) -> Option<(u64, SocketAddr, Option<IpAddr>, usize)> {
         let response = *self.pending.last()?;
-        if response.remote == remote {
+        if response.matches_path(remote, local_ip) {
             // We don't bother searching further because we expect that the on-path response will
             // get drained in the immediate future by a call to `pop_on_path`
             return None;
         }
         self.pending.pop();
-        Some((response.token, response.remote, response.local_ip))
+        Some((
+            response.token,
+            response.remote,
+            response.local_ip,
+            response.response_limit,
+        ))
     }
 
-    pub(crate) fn pop_on_path(&mut self, remote: SocketAddr) -> Option<u64> {
+    pub(crate) fn pop_on_path(
+        &mut self,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+    ) -> Option<u64> {
         let response = *self.pending.last()?;
-        if response.remote != remote {
+        if !response.matches_path(remote, local_ip) {
             // We don't bother searching further because we expect that the off-path response will
             // get drained in the immediate future by a call to `pop_off_path`
             return None;
@@ -438,6 +466,14 @@ struct PathResponse {
     /// The address the corresponding PATH_CHALLENGE was received from
     remote: SocketAddr,
     local_ip: Option<IpAddr>,
+    /// Conservative amplification budget from this authenticated packet alone.
+    response_limit: usize,
+}
+
+impl PathResponse {
+    fn matches_path(&self, remote: SocketAddr, local_ip: Option<IpAddr>) -> bool {
+        self.remote == remote && self.local_ip == local_ip
+    }
 }
 
 /// Summary statistics of packets that have been sent on a particular path, but which have not yet
@@ -487,5 +523,56 @@ mod adaptive_rtt_tests {
         assert_eq!(rtt.sampled_min(), Some(Duration::from_millis(300)));
         rtt.update(Duration::ZERO, Duration::from_secs(3));
         assert_eq!(rtt.sampled_min(), Some(Duration::from_millis(300)));
+    }
+}
+
+#[cfg(test)]
+mod path_response_tests {
+    use super::*;
+
+    #[test]
+    fn responses_are_keyed_by_both_addresses() {
+        let remote = "127.0.0.3:1234".parse().unwrap();
+        let a = Some("127.0.0.1".parse().unwrap());
+        let b = Some("127.0.0.2".parse().unwrap());
+        let mut responses = PathResponses::default();
+        responses.push(4, 10, remote, a, 1200);
+        responses.push(5, 20, remote, b, 100);
+
+        assert_eq!(
+            responses.pop_off_path(remote, a),
+            Some((20, remote, b, 300))
+        );
+        assert_eq!(responses.pop_on_path(remote, a), Some(10));
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn reordering_and_unknown_local_addresses_are_isolated() {
+        let remote = "127.0.0.3:1234".parse().unwrap();
+        let a = Some("127.0.0.1".parse().unwrap());
+        let mut responses = PathResponses::default();
+        responses.push(9, 90, remote, a, 50);
+        responses.push(8, 80, remote, a, 1200);
+        responses.push(10, 100, remote, None, 20);
+
+        assert_eq!(
+            responses.pop_off_path(remote, a),
+            Some((100, remote, None, 60))
+        );
+        assert_eq!(responses.pop_on_path(remote, a), Some(90));
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn response_queue_remains_bounded_across_local_addresses() {
+        let remote = "127.0.0.3:1234".parse().unwrap();
+        let mut responses = PathResponses::default();
+        for i in 0..17u8 {
+            let ip = Some(std::net::Ipv4Addr::new(127, 0, 0, i + 1).into());
+            responses.push(u64::from(i), u64::from(i), remote, ip, 40);
+        }
+        assert_eq!(responses.pending.len(), 16);
+        assert!(responses.pending.iter().all(|response| response.token < 16));
     }
 }

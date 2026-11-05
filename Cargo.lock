@@ -2108,6 +2108,7 @@ dependencies = [
  "lazy_static",
  "lru-slab",
  "qlog",
+ "quinn-udp",
  "rand 0.10.1",
  "rand_pcg",
  "rcgen",

@@ -75,6 +75,9 @@ tracing-subscriber = { workspace = true }
 lazy_static = "1"
 wasm-bindgen-test = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+quinn-udp = { path = "../quinn-udp", default-features = false }
+
 [lints.rust]
 # https://rust-fuzz.github.io/book/cargo-fuzz/guide.html#cfgfuzzing
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

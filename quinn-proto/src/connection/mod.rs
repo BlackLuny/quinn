@@ -150,6 +150,12 @@ pub struct Connection {
     /// Whether MTU detection is supported in this environment
     allow_mtud: bool,
     prev_path: Option<(ConnectionId, PathData)>,
+    /// A different local destination is probed before replacing the active path.
+    local_path_candidate: Option<LocalPathCandidate>,
+    /// Recently unsuccessful local paths, bounded per connection.
+    local_path_backoffs: Vec<LocalPathBackoff>,
+    /// CIDs used on candidate paths, retained until the CID queue retires them.
+    local_path_cid_uses: Vec<LocalPathCidUse>,
     /// Whether the application replaced the congestion controller
     ///
     /// Such a controller follows the connection across migrations instead of being reset to the
@@ -245,6 +251,37 @@ pub struct Connection {
     version: u32,
 }
 
+/// A same-peer local path stays separate from the validated active path until
+/// both reachability and the minimum QUIC datagram size have been verified.
+/// The separate amplification budget is conservative: it can require a short
+/// probe and an extra RTT even if the remote address was validated on the old
+/// local path.
+struct LocalPathCandidate {
+    remote: SocketAddr,
+    local_ip: IpAddr,
+    cid: ConnectionId,
+    challenge: u64,
+    old_path_challenge: u64,
+    challenge_pending: bool,
+    challenge_was_unpadded: bool,
+    address_validated: bool,
+    total_recvd: u64,
+    total_sent: u64,
+}
+
+struct LocalPathCidUse {
+    cid: ConnectionId,
+    remote: SocketAddr,
+    local_ip: Option<IpAddr>,
+}
+
+struct LocalPathBackoff {
+    remote: SocketAddr,
+    local_ip: IpAddr,
+    failures: u32,
+    retry_at: Instant,
+}
+
 impl Connection {
     pub(crate) fn new(
         endpoint_config: Arc<EndpointConfig>,
@@ -291,6 +328,9 @@ impl Connection {
             path_counter: 0,
             allow_mtud,
             prev_path: None,
+            local_path_candidate: None,
+            local_path_backoffs: Vec::new(),
+            local_path_cid_uses: Vec::new(),
             app_congestion: false,
             state,
             side: connection_side,
@@ -461,6 +501,18 @@ impl Connection {
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
         assert!(max_datagrams != 0);
+        // Prefer a CID not used on another path. If none is available, keep
+        // sending with the current CID so retirement frames can reach the peer
+        // and elicit a replacement instead of deadlocking the connection.
+        let _ = self.ensure_active_cid_for_path();
+        if self
+            .local_path_candidate
+            .as_ref()
+            .is_some_and(|candidate| !self.rem_cids.spares().any(|cid| cid == candidate.cid))
+        {
+            self.cancel_local_path_candidate();
+            let _ = self.ensure_active_cid_for_path();
+        }
         let max_datagrams = match self.config.enable_segmentation_offload {
             false => 1,
             true => max_datagrams,
@@ -500,6 +552,45 @@ impl Connection {
             }
             _ => false,
         };
+
+        // Answer a pending peer challenge before spending candidate-path budget
+        // on our own validation probe.
+        if !close
+            && self.local_path_candidate.is_some()
+            && self
+                .path_responses
+                .peek_off_path(self.path.remote, self.path.local_ip)
+                .is_none()
+        {
+            if let Some(probe) = self.send_local_path_challenge(now, buf) {
+                return Some(probe);
+            }
+        }
+
+        // Each off-path response is funded only by the authenticated packet that
+        // carried its challenge. Drop responses too small to fit, rather than
+        // spinning on work that cannot satisfy the amplification limit.
+        while let Some((remote, local_ip, limit)) = self
+            .path_responses
+            .peek_off_path(self.path.remote, self.path.local_ip)
+        {
+            let limit = self.off_path_response_limit(remote, local_ip, limit);
+            let Some(cid) = self.off_path_response_cid(remote, local_ip) else {
+                trace!("discarding PATH_RESPONSE without an unused peer CID");
+                let _ = self
+                    .path_responses
+                    .pop_off_path(self.path.remote, self.path.local_ip);
+                continue;
+            };
+            let overhead = 1 + cid.len() + 4 + self.tag_len_1rtt();
+            if limit >= overhead.saturating_add(9) {
+                break;
+            }
+            trace!("discarding PATH_RESPONSE with insufficient amplification budget");
+            let _ = self
+                .path_responses
+                .pop_off_path(self.path.remote, self.path.local_ip);
+        }
 
         // Check whether we need to send an ACK_FREQUENCY frame
         if let Some(config) = &self.config.ack_frequency_config {
@@ -545,6 +636,30 @@ impl Connection {
                 space_idx += 1;
                 continue;
             }
+
+            // The previous response may have been discarded in this loop,
+            // exposing a new queue entry that the initial filter did not see.
+            // Resolve its CID before allocating a datagram or consuming a probe.
+            let off_path_cid =
+                if !close && space_id == SpaceId::Data && num_datagrams == 0 && buf.is_empty() {
+                    if let Some((remote, local_ip, _)) = self
+                        .path_responses
+                        .peek_off_path(self.path.remote, self.path.local_ip)
+                    {
+                        let Some(cid) = self.off_path_response_cid(remote, local_ip) else {
+                            trace!("discarding PATH_RESPONSE without an unused peer CID");
+                            let _ = self
+                                .path_responses
+                                .pop_off_path(self.path.remote, self.path.local_ip);
+                            continue;
+                        };
+                        Some(cid)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
             let mut ack_eliciting = !self.spaces[space_id].pending.is_empty(&self.streams)
                 || self.spaces[space_id].ping_pending
@@ -771,10 +886,11 @@ impl Connection {
                 "Previous packet must have been finished"
             );
 
+            let cid = off_path_cid.unwrap_or_else(|| self.rem_cids.active());
             let builder = builder_storage.insert(PacketBuilder::new(
                 now,
                 space_id,
-                self.rem_cids.active(),
+                cid,
                 buf,
                 buf_capacity,
                 datagram_start,
@@ -853,9 +969,11 @@ impl Connection {
 
             // Send an off-path PATH_RESPONSE. Prioritized over on-path data to ensure that path
             // validation can occur while the link is saturated.
-            if space_id == SpaceId::Data && num_datagrams == 1 {
-                if let Some((token, remote, local_ip)) =
-                    self.path_responses.pop_off_path(self.path.remote)
+            if space_id == SpaceId::Data && num_datagrams == 1 && builder.partial_encode.start == 0
+            {
+                if let Some((token, remote, local_ip, limit)) = self
+                    .path_responses
+                    .pop_off_path(self.path.remote, self.path.local_ip)
                 {
                     // `unwrap` guaranteed to succeed because `builder_storage` was populated just
                     // above.
@@ -863,8 +981,29 @@ impl Connection {
                     trace!("PATH_RESPONSE {:08x} (off-path)", token);
                     buf.write(frame::FrameType::PATH_RESPONSE);
                     buf.write(token);
+                    let limit = self.off_path_response_limit(remote, local_ip, limit);
+                    // RFC 9000 permits omitting padding when it would exceed the
+                    // anti-amplification budget for this path.
+                    if limit >= MIN_INITIAL_SIZE as usize {
+                        builder.pad_to(MIN_INITIAL_SIZE);
+                    }
+                    if builder
+                        .min_size
+                        .max(buf.len())
+                        .saturating_add(builder.tag_len)
+                        > limit
+                    {
+                        trace!("discarding PATH_RESPONSE that exceeds amplification budget");
+                        buf.clear();
+                        // The unfinished datagram was the first and only one.
+                        // Start over so unrelated queued traffic can still go out.
+                        num_datagrams = 0;
+                        buf_capacity = 0;
+                        datagram_start = 0;
+                        coalesce = true;
+                        continue;
+                    }
                     self.stats.frame_tx.path_response += 1;
-                    builder.pad_to(MIN_INITIAL_SIZE);
                     builder.finish_and_track(
                         now,
                         self,
@@ -874,6 +1013,24 @@ impl Connection {
                         }),
                         buf,
                     );
+                    if let Some(candidate) =
+                        self.local_path_candidate.as_mut().filter(|candidate| {
+                            remote == candidate.remote && local_ip == Some(candidate.local_ip)
+                        })
+                    {
+                        candidate.total_sent =
+                            candidate.total_sent.saturating_add(buf.len() as u64);
+                    } else if remote == self.path.remote {
+                        self.path.total_sent =
+                            self.path.total_sent.saturating_add(buf.len() as u64);
+                    }
+                    if remote == self.path.remote {
+                        if let (Some(active), Some(received)) = (self.path.local_ip, local_ip) {
+                            if active != received {
+                                self.mark_local_path_cid_used(cid, remote, Some(received));
+                            }
+                        }
+                    }
                     self.stats.udp_tx.on_sent(1, buf.len());
                     return Some(Transmit {
                         destination: remote,
@@ -1017,6 +1174,390 @@ impl Connection {
         })
     }
 
+    fn off_path_response_cid(
+        &self,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+    ) -> Option<ConnectionId> {
+        if let Some(candidate) = self
+            .local_path_candidate
+            .as_ref()
+            .filter(|candidate| remote == candidate.remote && local_ip == Some(candidate.local_ip))
+        {
+            return Some(candidate.cid);
+        }
+        if remote == self.path.remote
+            && matches!((self.path.local_ip, local_ip), (Some(active), Some(received)) if active != received)
+        {
+            return self.rem_cids.spares().find(|&cid| {
+                self.local_path_candidate
+                    .as_ref()
+                    .is_none_or(|candidate| candidate.cid != cid)
+                    && self.cid_usable_for_path(cid, remote, local_ip)
+            });
+        }
+        Some(self.rem_cids.active())
+    }
+
+    fn off_path_response_limit(
+        &self,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+        limit: usize,
+    ) -> usize {
+        if let Some(candidate) = self
+            .local_path_candidate
+            .as_ref()
+            .filter(|candidate| remote == candidate.remote && local_ip == Some(candidate.local_ip))
+        {
+            if candidate.address_validated {
+                return limit;
+            }
+            let remaining = candidate
+                .total_recvd
+                .saturating_mul(3)
+                .saturating_sub(candidate.total_sent);
+            return limit.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        }
+        if remote != self.path.remote || self.path.validated {
+            return limit;
+        }
+        let remaining = self
+            .path
+            .total_recvd
+            .saturating_mul(3)
+            .saturating_sub(self.path.total_sent);
+        limit.min(usize::try_from(remaining).unwrap_or(usize::MAX))
+    }
+
+    fn local_path_probe_interval(&self) -> Duration {
+        let initial = 3 * self.config.initial_rtt + self.ack_frequency.max_ack_delay_for_pto();
+        cmp::max(self.pto(SpaceId::Data), initial)
+    }
+
+    fn cid_usable_for_path(
+        &self,
+        cid: ConnectionId,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+    ) -> bool {
+        self.local_path_cid_uses
+            .iter()
+            .find(|used| used.cid == cid)
+            .is_none_or(|used| used.remote == remote && used.local_ip == local_ip)
+    }
+
+    fn prune_local_path_cid_uses(&mut self) {
+        let cids = &self.rem_cids;
+        self.local_path_cid_uses
+            .retain(|used| cids.contains(used.cid));
+    }
+
+    fn mark_local_path_cid_used(
+        &mut self,
+        cid: ConnectionId,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+    ) {
+        self.prune_local_path_cid_uses();
+        if !self.local_path_cid_uses.iter().any(|used| used.cid == cid) {
+            self.local_path_cid_uses.push(LocalPathCidUse {
+                cid,
+                remote,
+                local_ip,
+            });
+        }
+    }
+
+    fn ensure_active_cid_for_path(&mut self) -> bool {
+        if self.local_path_cid_uses.is_empty() {
+            return true;
+        }
+        self.prune_local_path_cid_uses();
+        if self.cid_usable_for_path(self.rem_cids.active(), self.path.remote, self.path.local_ip) {
+            return true;
+        }
+        self.update_rem_cid_for_path()
+    }
+
+    /// Prefer a spare that has not been used on another local path. If all
+    /// spares are path-bound, leave the active CID in place for continuity.
+    fn update_rem_cid_for_path(&mut self) -> bool {
+        let target = self
+            .rem_cids
+            .spares()
+            .find(|&cid| self.cid_usable_for_path(cid, self.path.remote, self.path.local_ip));
+        let Some(target) = target else {
+            return false;
+        };
+        while self.rem_cids.active() != target {
+            if !self.update_rem_cid() {
+                return false;
+            }
+        }
+        self.prune_local_path_cid_uses();
+        true
+    }
+
+    fn reclaim_local_path_cids(&mut self) {
+        self.prune_local_path_cid_uses();
+        let mut saw_used_elsewhere = false;
+        let target = self.rem_cids.spares().find(|&cid| {
+            if !self.cid_usable_for_path(cid, self.path.remote, self.path.local_ip) {
+                saw_used_elsewhere = true;
+                false
+            } else {
+                saw_used_elsewhere
+            }
+        });
+        if let Some(target) = target {
+            while self.rem_cids.active() != target {
+                if !self.update_rem_cid() {
+                    break;
+                }
+            }
+        }
+        self.prune_local_path_cid_uses();
+    }
+
+    fn take_local_path_candidate(&mut self) -> Option<LocalPathCandidate> {
+        self.timers.stop(Timer::LocalPathProbe);
+        self.timers.stop(Timer::LocalPathValidation);
+        let candidate = self.local_path_candidate.take()?;
+        if self.path.challenge == Some(candidate.old_path_challenge) {
+            self.path.challenge = None;
+            self.path.challenge_pending = false;
+        }
+        Some(candidate)
+    }
+
+    fn cancel_local_path_candidate(&mut self) {
+        if self.local_path_candidate.is_none() {
+            return;
+        }
+        let Some(candidate) = self.take_local_path_candidate() else {
+            return;
+        };
+        if candidate.total_sent != 0 {
+            // Preserve the CID queue's contiguous retirement window. If a fresh
+            // spare exists beyond the used candidate CID, rotate to it on the
+            // active path and retire the intervening CIDs in sequence.
+            self.reclaim_local_path_cids();
+        }
+    }
+
+    fn record_local_path_failure(&mut self, now: Instant, remote: SocketAddr, local_ip: IpAddr) {
+        let previous = self
+            .local_path_backoffs
+            .iter()
+            .position(|entry| entry.remote == remote && entry.local_ip == local_ip)
+            .map(|index| self.local_path_backoffs.remove(index));
+        let failures = previous.map_or(1, |entry| {
+            if now >= entry.retry_at + LOCAL_PATH_MAX_BACKOFF {
+                1
+            } else {
+                entry
+                    .failures
+                    .saturating_add(1)
+                    .min(LOCAL_PATH_MAX_BACKOFF_EXPONENT + 1)
+            }
+        });
+        let delay = self
+            .local_path_probe_interval()
+            .min(LOCAL_PATH_MAX_BACKOFF)
+            .saturating_mul(1 << (failures - 1))
+            .min(LOCAL_PATH_MAX_BACKOFF);
+        if self.local_path_backoffs.len() == MAX_LOCAL_PATH_BACKOFFS {
+            self.local_path_backoffs.remove(0);
+        }
+        self.local_path_backoffs.push(LocalPathBackoff {
+            remote,
+            local_ip,
+            failures,
+            retry_at: now + delay,
+        });
+    }
+
+    fn cancel_unpreferred_local_path_candidate(&mut self, now: Instant) {
+        if let Some(candidate) = self
+            .local_path_candidate
+            .as_ref()
+            .filter(|candidate| candidate.total_sent != 0)
+        {
+            self.record_local_path_failure(now, candidate.remote, candidate.local_ip);
+        }
+        self.cancel_local_path_candidate();
+    }
+
+    fn start_local_path_candidate(&mut self, now: Instant, remote: SocketAddr, local_ip: IpAddr) {
+        if self
+            .local_path_candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.remote == remote && candidate.local_ip == local_ip)
+        {
+            return;
+        }
+        if self.local_path_backoffs.iter().any(|entry| {
+            entry.remote == remote && entry.local_ip == local_ip && now < entry.retry_at
+        }) {
+            return;
+        }
+        self.cancel_unpreferred_local_path_candidate(now);
+        if !self.ensure_active_cid_for_path() {
+            return;
+        }
+        let Some(cid) = self
+            .rem_cids
+            .spares()
+            .find(|&cid| self.cid_usable_for_path(cid, remote, Some(local_ip)))
+        else {
+            trace!("cannot probe a local path without an unused peer CID");
+            return;
+        };
+        // Probing A elicits non-probing traffic on the established path, which
+        // can cancel a spurious candidate before it is promoted.
+        let old_path_challenge = self.rng.random();
+        self.path.challenge = Some(old_path_challenge);
+        self.path.challenge_pending = true;
+        self.local_path_candidate = Some(LocalPathCandidate {
+            remote,
+            local_ip,
+            cid,
+            challenge: self.rng.random(),
+            old_path_challenge,
+            challenge_pending: true,
+            challenge_was_unpadded: false,
+            address_validated: false,
+            total_recvd: 0,
+            total_sent: 0,
+        });
+        let timeout = 3 * self.local_path_probe_interval();
+        self.timers.set(Timer::LocalPathValidation, now + timeout);
+    }
+
+    fn handle_local_path_response(&mut self, now: Instant, token: u64) -> bool {
+        let Some(candidate) = self.local_path_candidate.as_ref() else {
+            return false;
+        };
+        if candidate.challenge != token {
+            return false;
+        }
+        if !self.rem_cids.spares().any(|cid| cid == candidate.cid) {
+            self.cancel_local_path_candidate();
+            return true;
+        }
+        if candidate.challenge_was_unpadded {
+            // A response to a short probe validates the peer address, not the
+            // minimum QUIC MTU. A fresh token makes the second proof distinct.
+            let candidate = self.local_path_candidate.as_mut().unwrap();
+            candidate.address_validated = true;
+            candidate.challenge = self.rng.random();
+            candidate.challenge_pending = true;
+            candidate.challenge_was_unpadded = false;
+            self.timers.stop(Timer::LocalPathProbe);
+            let timeout = 3 * self.local_path_probe_interval();
+            self.timers.set(Timer::LocalPathValidation, now + timeout);
+            return true;
+        }
+
+        let remote = candidate.remote;
+        let local_ip = candidate.local_ip;
+        let target_cid = candidate.cid;
+        let _ = self.take_local_path_candidate();
+        self.migrate(now, remote, Some(local_ip));
+        self.path.validated = true;
+        self.path.challenge = None;
+        self.path.challenge_pending = false;
+        self.timers.stop(Timer::PathValidation);
+        while self.rem_cids.active() != target_cid {
+            if !self.update_rem_cid() {
+                self.kill(ConnectionError::CidsExhausted);
+                return true;
+            }
+        }
+        self.local_path_backoffs
+            .retain(|entry| entry.remote != remote || entry.local_ip != local_ip);
+        self.prune_local_path_cid_uses();
+        self.set_loss_detection_timer(now);
+        self.spin = false;
+        true
+    }
+
+    fn send_local_path_challenge(&mut self, now: Instant, buf: &mut Vec<u8>) -> Option<Transmit> {
+        let candidate = self.local_path_candidate.as_ref()?;
+        if !candidate.challenge_pending || self.spaces[SpaceId::Data].crypto.is_none() {
+            return None;
+        }
+        let budget = if candidate.address_validated {
+            usize::from(MIN_INITIAL_SIZE)
+        } else {
+            let remaining = candidate
+                .total_recvd
+                .saturating_mul(3)
+                .saturating_sub(candidate.total_sent);
+            usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(usize::from(MIN_INITIAL_SIZE))
+        };
+        let cid = candidate.cid;
+        let remote = candidate.remote;
+        let local_ip = candidate.local_ip;
+        let token = candidate.challenge;
+        let overhead = 1 + cid.len() + 4 + self.tag_len_1rtt();
+        if budget < overhead.saturating_add(9) {
+            return None;
+        }
+        let bytes = budget as u64;
+        if self.path.in_flight.bytes + bytes >= self.path.congestion.window() {
+            return None;
+        }
+        if let Some(delay) = self.path.pacing.delay(
+            self.path.rtt.get(),
+            bytes,
+            self.path.current_mtu(),
+            self.path.congestion.window(),
+            self.path.congestion.metrics().pacing_rate,
+            now,
+        ) {
+            self.timers.set(Timer::Pacing, delay);
+            return None;
+        }
+        buf.reserve(budget);
+        let mut builder = PacketBuilder::new(now, SpaceId::Data, cid, buf, budget, 0, true, self)?;
+        buf.write(frame::FrameType::PATH_CHALLENGE);
+        buf.write(token);
+        if budget >= MIN_INITIAL_SIZE as usize {
+            builder.pad_to(MIN_INITIAL_SIZE);
+        }
+        if builder
+            .min_size
+            .max(buf.len())
+            .saturating_add(builder.tag_len)
+            > budget
+        {
+            buf.clear();
+            return None;
+        }
+        builder.finish(self, now, buf);
+        let candidate = self.local_path_candidate.as_mut().unwrap();
+        candidate.total_sent = candidate.total_sent.saturating_add(buf.len() as u64);
+        candidate.challenge_pending = false;
+        candidate.challenge_was_unpadded |= buf.len() < MIN_INITIAL_SIZE as usize;
+        self.mark_local_path_cid_used(cid, remote, Some(local_ip));
+        self.path.pacing.on_transmit(buf.len() as u16);
+        self.stats.frame_tx.path_challenge += 1;
+        self.stats.udp_tx.on_sent(1, buf.len());
+        let retry = self.local_path_probe_interval();
+        self.timers.set(Timer::LocalPathProbe, now + retry);
+        Some(Transmit {
+            destination: remote,
+            size: buf.len(),
+            ecn: None,
+            segment_size: None,
+            src_ip: Some(local_ip),
+        })
+    }
+
     /// Send PATH_CHALLENGE for a previous path if necessary
     fn send_path_challenge(&mut self, now: Instant, buf: &mut Vec<u8>) -> Option<Transmit> {
         let (prev_cid, prev_path) = self.prev_path.as_mut()?;
@@ -1131,6 +1672,7 @@ impl Connection {
                 // the data received is accounted for the most recent path by accessing
                 // `path` after `handle_decode`.
                 self.path.total_recvd = self.path.total_recvd.saturating_add(data_len as u64);
+                self.record_local_candidate_received(remote, local_ip, data_len);
 
                 if let Some(data) = remaining {
                     self.stats.udp_rx.bytes += data.len() as u64;
@@ -1216,6 +1758,18 @@ impl Connection {
                     self.path.challenge = None;
                     self.path.challenge_pending = false;
                     self.set_loss_detection_timer(now);
+                }
+                Timer::LocalPathValidation => {
+                    trace!("candidate local path validation failed; keeping the active path");
+                    if let Some(candidate) = self.local_path_candidate.as_ref() {
+                        self.record_local_path_failure(now, candidate.remote, candidate.local_ip);
+                    }
+                    self.cancel_local_path_candidate();
+                }
+                Timer::LocalPathProbe => {
+                    if let Some(candidate) = self.local_path_candidate.as_mut() {
+                        candidate.challenge_pending = true;
+                    }
                 }
                 Timer::Pacing => trace!("pacing timer expired"),
                 Timer::PushNewCid => {
@@ -2059,7 +2613,14 @@ impl Connection {
         );
 
         let local_ip = self.path.local_ip;
-        self.process_decrypted_packet(now, remote, local_ip, Some(packet_number), packet.into())?;
+        self.process_decrypted_packet(
+            now,
+            remote,
+            local_ip,
+            Some(packet_number),
+            len,
+            packet.into(),
+        )?;
         if let Some(data) = remaining {
             self.handle_coalesced(now, remote, local_ip, ecn, data);
         }
@@ -2245,6 +2806,21 @@ impl Connection {
         self.set_loss_detection_timer(now)
     }
 
+    fn record_local_candidate_received(
+        &mut self,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+        len: usize,
+    ) {
+        if let Some(candidate) = self
+            .local_path_candidate
+            .as_mut()
+            .filter(|candidate| remote == candidate.remote && local_ip == Some(candidate.local_ip))
+        {
+            candidate.total_recvd = candidate.total_recvd.saturating_add(len as u64);
+        }
+    }
+
     fn handle_coalesced(
         &mut self,
         now: Instant,
@@ -2264,7 +2840,9 @@ impl Connection {
             ) {
                 Ok((partial_decode, rest)) => {
                     remaining = rest;
+                    let len = partial_decode.len();
                     self.handle_decode(now, remote, local_ip, ecn, partial_decode);
+                    self.record_local_candidate_received(remote, local_ip, len);
                 }
                 Err(e) => {
                     trace!("malformed header: {}", e);
@@ -2326,6 +2904,9 @@ impl Connection {
 
         let was_closed = self.state.is_closed();
         let was_drained = self.state.is_drained();
+        let received_len = packet
+            .as_ref()
+            .map_or(0, |p| p.header_data.len().saturating_add(p.payload.len()));
 
         let decrypted = match packet {
             None => Err(None),
@@ -2401,7 +2982,14 @@ impl Connection {
                         );
                     }
 
-                    self.process_decrypted_packet(now, remote, local_ip, number, packet)
+                    self.process_decrypted_packet(
+                        now,
+                        remote,
+                        local_ip,
+                        number,
+                        received_len,
+                        packet,
+                    )
                 }
             }
         };
@@ -2459,14 +3047,20 @@ impl Connection {
         remote: SocketAddr,
         local_ip: Option<IpAddr>,
         number: Option<u64>,
+        received_len: usize,
         packet: Packet,
     ) -> Result<(), ConnectionError> {
         let state = match self.state {
             State::Established => {
                 match packet.header.space() {
-                    SpaceId::Data => {
-                        self.process_payload(now, remote, local_ip, number.unwrap(), packet)?
-                    }
+                    SpaceId::Data => self.process_payload(
+                        now,
+                        remote,
+                        local_ip,
+                        number.unwrap(),
+                        received_len,
+                        packet,
+                    )?,
                     _ if packet.header.has_frames() => self.process_early_payload(now, packet)?,
                     _ => {
                         trace!("discarding unexpected pre-handshake packet");
@@ -2692,7 +3286,7 @@ impl Connection {
                 ty: LongType::ZeroRtt,
                 ..
             } => {
-                self.process_payload(now, remote, local_ip, number.unwrap(), packet)?;
+                self.process_payload(now, remote, local_ip, number.unwrap(), received_len, packet)?;
                 Ok(())
             }
             Header::VersionNegotiate { .. } => {
@@ -2779,6 +3373,7 @@ impl Connection {
         remote: SocketAddr,
         local_ip: Option<IpAddr>,
         number: u64,
+        received_len: usize,
         packet: Packet,
     ) -> Result<(), TransportError> {
         let payload = packet.payload.freeze();
@@ -2851,8 +3446,13 @@ impl Connection {
                     close = Some(reason);
                 }
                 Frame::PathChallenge(token) => {
-                    self.path_responses.push(number, token, remote, local_ip);
-                    if remote == self.path.remote {
+                    self.path_responses
+                        .push(number, token, remote, local_ip, received_len);
+                    let local_matches = match (self.path.local_ip, local_ip) {
+                        (Some(active), Some(received)) => active == received,
+                        _ => true,
+                    };
+                    if remote == self.path.remote && local_matches {
                         // PATH_CHALLENGE on active path, possible off-path packet forwarding
                         // attack. Send a non-probing packet to recover the active path.
                         match self.peer_supports_ack_frequency() {
@@ -2862,7 +3462,9 @@ impl Connection {
                     }
                 }
                 Frame::PathResponse(token) => {
-                    if self.path.challenge == Some(token) && remote == self.path.remote {
+                    if self.handle_local_path_response(now, token) {
+                        // Candidate validation is independent of the active path.
+                    } else if self.path.challenge == Some(token) && remote == self.path.remote {
                         trace!("new path validated");
                         self.timers.stop(Timer::PathValidation);
                         self.path.challenge = None;
@@ -2995,7 +3597,12 @@ impl Connection {
                             continue;
                         }
                     };
-
+                    if self.local_path_candidate.is_none()
+                        && !self.local_path_cid_uses.is_empty()
+                        && self.ensure_active_cid_for_path()
+                    {
+                        self.reclaim_local_path_cids();
+                    }
                     if self.side.is_server() && self.rem_cids.active_seq() == 0 {
                         // We're a server still using the initial remote CID for the client, so
                         // let's switch immediately to enable clientside stateless resets.
@@ -3087,24 +3694,54 @@ impl Connection {
             self.close = true;
         }
 
-        if remote != self.path.remote
-            && !is_probing_packet
-            && number == self.spaces[SpaceId::Data].rx_packet
-        {
-            let ConnectionSide::Server { ref server_config } = self.side else {
-                panic!("packets from unknown remote should be dropped by clients");
-            };
-            debug_assert!(
-                server_config.migration,
-                "migration-initiating packets should have been dropped immediately"
-            );
-            self.migrate(now, remote, local_ip);
-            // Break linkability, if possible
-            if !self.update_rem_cid() {
-                // No spare CID: the token stays, but the endpoint must look it up at the new address.
-                self.republish_reset_token();
+        if !is_probing_packet && number == self.spaces[SpaceId::Data].rx_packet {
+            if remote != self.path.remote {
+                self.cancel_local_path_candidate();
+                let _ = self.ensure_active_cid_for_path();
+                let previous_remote = self.path.remote;
+                let previous_local_ip = self.path.local_ip;
+                let ConnectionSide::Server { ref server_config } = self.side else {
+                    panic!("packets from unknown remote should be dropped by clients");
+                };
+                debug_assert!(
+                    server_config.migration,
+                    "migration-initiating packets should have been dropped immediately"
+                );
+                self.migrate(now, remote, local_ip);
+                // Break linkability, if possible
+                if !self.update_rem_cid_for_path() {
+                    if previous_local_ip != local_ip {
+                        // Remember the old path even when its local metadata
+                        // is unavailable. A later replacement CID can then
+                        // end the temporary cross-local-address reuse.
+                        self.mark_local_path_cid_used(
+                            self.rem_cids.active(),
+                            previous_remote,
+                            previous_local_ip,
+                        );
+                    }
+                    // No spare CID: the token stays, but the endpoint must look it up at the new address.
+                    self.republish_reset_token();
+                }
+                self.spin = false;
+            } else if self.side.is_server()
+                && !self.is_handshaking()
+                && !self.is_closed()
+                && self.path.validated
+                && (self.path.challenge.is_none() || self.local_path_candidate.is_some())
+            {
+                match (self.path.local_ip, local_ip) {
+                    (Some(active), Some(received)) if active != received => {
+                        self.start_local_path_candidate(now, remote, received);
+                    }
+                    (Some(active), Some(received))
+                        if active == received && self.local_path_candidate.is_some() =>
+                    {
+                        self.cancel_unpreferred_local_path_candidate(now);
+                    }
+                    _ => {} // Missing local metadata cannot select a path.
+                }
             }
-            self.spin = false;
         }
 
         Ok(())
@@ -3121,7 +3758,8 @@ impl Connection {
         // the same host keeps the path state (and any congestion controller the application
         // installed): IPv4 peers behind a dual-stack socket arrive as v4-mapped IPv6, and an
         // IPv6 host changing only its source port is still the same network path.
-        let mut new_path = if same_host(self.path.remote, remote) {
+        let mut new_path = if same_host(self.path.remote, remote) && self.path.local_ip == local_ip
+        {
             PathData::from_previous(remote, local_ip, &self.path, self.path_counter, now)
         } else {
             let peer_max_udp_payload_size =
@@ -3321,7 +3959,10 @@ impl Connection {
 
         // PATH_RESPONSE
         if buf.len() + 9 < max_size && space_id == SpaceId::Data {
-            if let Some(token) = self.path_responses.pop_on_path(self.path.remote) {
+            if let Some(token) = self
+                .path_responses
+                .pop_on_path(self.path.remote, self.path.local_ip)
+            {
                 sent.non_retransmits = true;
                 sent.requires_padding = true;
                 trace!("PATH_RESPONSE {:08x}", token);
@@ -3648,6 +4289,157 @@ impl Connection {
     /// the Acknowledgement Frequency extension
     pub(crate) fn immediate_ack(&mut self) {
         self.spaces[self.highest_space].immediate_ack_pending = true;
+    }
+
+    /// Test-only injection; receiver follows the production authenticated path.
+    #[cfg(test)]
+    pub(crate) fn repro_queue_path_challenge(&mut self) {
+        self.path.challenge = Some(0x918);
+        self.path.challenge_pending = true;
+    }
+
+    /// Construct an authenticated, deliberately unpadded challenge to exercise
+    /// the receiver's anti-amplification handling.
+    #[cfg(test)]
+    pub(crate) fn test_short_path_challenge(
+        &mut self,
+        now: Instant,
+        buf: &mut Vec<u8>,
+    ) -> Transmit {
+        let remote = self.path.remote;
+        let local_ip = self.path.local_ip;
+        let capacity = usize::from(self.path.current_mtu());
+        let builder = PacketBuilder::new(
+            now,
+            SpaceId::Data,
+            self.rem_cids.active(),
+            buf,
+            capacity,
+            0,
+            true,
+            self,
+        )
+        .unwrap();
+        buf.write(frame::FrameType::PATH_CHALLENGE);
+        buf.write(0x918u64);
+        self.path.challenge = Some(0x918);
+        self.stats.frame_tx.path_challenge += 1;
+        builder.finish_and_track(
+            now,
+            self,
+            Some(SentFrames {
+                non_retransmits: true,
+                ..SentFrames::default()
+            }),
+            buf,
+        );
+        self.path.total_sent = self.path.total_sent.saturating_add(buf.len() as u64);
+        self.stats.udp_tx.on_sent(1, buf.len());
+        Transmit {
+            destination: remote,
+            size: buf.len(),
+            ecn: None,
+            segment_size: None,
+            src_ip: local_ip,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_unvalidated_path_bytes(&mut self, received: u64, sent: u64) {
+        self.path.validated = false;
+        self.path.total_recvd = received;
+        self.path.total_sent = sent;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_path_bytes(&self) -> (u64, u64) {
+        (self.path.total_recvd, self.path.total_sent)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_local_path_candidate(&self) -> Option<(bool, bool, bool, u64, u64)> {
+        self.local_path_candidate.as_ref().map(|candidate| {
+            (
+                candidate.address_validated,
+                candidate.challenge_pending,
+                candidate.challenge_was_unpadded,
+                candidate.total_recvd,
+                candidate.total_sent,
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_local_path_backoff(
+        &self,
+        remote: SocketAddr,
+        local_ip: IpAddr,
+    ) -> Option<(u32, Instant)> {
+        self.local_path_backoffs
+            .iter()
+            .find(|entry| entry.remote == remote && entry.local_ip == local_ip)
+            .map(|entry| (entry.failures, entry.retry_at))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_local_path_backoff_count(&self) -> usize {
+        self.local_path_backoffs.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_path_validation_state(&self) -> (bool, bool) {
+        (self.path.validated, self.path.challenge.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_local_candidate_cid(&self) -> Option<ConnectionId> {
+        self.local_path_candidate
+            .as_ref()
+            .map(|candidate| candidate.cid)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_remote_cids(&self) -> (ConnectionId, Option<ConnectionId>) {
+        (self.rem_cids.active(), self.rem_cids.spares().next())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_exhaust_spare_cids(&mut self) {
+        while self.update_rem_cid() {}
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_keep_one_spare_cid(&mut self) -> frame::NewConnectionId {
+        while self.rem_cids.spares().count() > 1 {
+            assert!(self.update_rem_cid());
+        }
+        self.rem_cids.test_first_spare_frame().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reissue_cid_with_retirement(&mut self, frame: frame::NewConnectionId) {
+        self.local_cid_state
+            .assign_retire_seq(frame.retire_prior_to);
+        self.spaces[SpaceId::Data]
+            .pending
+            .new_cids
+            .push(crate::shared::IssuedCid {
+                sequence: frame.sequence,
+                id: frame.id,
+                reset_token: frame.reset_token,
+            });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_send_pending_ack(&mut self) {
+        self.spaces[SpaceId::Data]
+            .pending_acks
+            .set_immediate_ack_required();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_active_cid_used_on_another_path(&self) -> bool {
+        !self.cid_usable_for_path(self.rem_cids.active(), self.path.remote, self.path.local_ip)
     }
 
     /// Decodes a packet, returning its decrypted payload, so it can be inspected in tests
@@ -4110,6 +4902,11 @@ fn get_max_ack_delay(params: &TransportParameters) -> Duration {
 
 // Prevents overflow and improves behavior in extreme circumstances
 const MAX_BACKOFF_EXPONENT: u32 = 16;
+
+// Bound both per-connection memory and retries for a persistently broken local path.
+const MAX_LOCAL_PATH_BACKOFFS: usize = 8;
+const LOCAL_PATH_MAX_BACKOFF_EXPONENT: u32 = 6;
+const LOCAL_PATH_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Minimal remaining size to allow packet coalescing, excluding cryptographic tag
 ///
