@@ -107,6 +107,18 @@ impl CidQueue {
         self.iter().any(|(_, (id, _))| id == cid)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_first_spare_frame(&self) -> Option<NewConnectionId> {
+        let (step, (id, reset_token)) = self.iter().nth(1)?;
+        let sequence = self.offset + step as u64;
+        Some(NewConnectionId {
+            sequence,
+            retire_prior_to: sequence,
+            id,
+            reset_token: reset_token.unwrap(),
+        })
+    }
+
     /// Iterate CIDs in CidQueue that are not `None`, including the active CID
     fn iter(&self) -> impl Iterator<Item = (usize, CidData)> + '_ {
         (0..Self::LEN).filter_map(move |step| {

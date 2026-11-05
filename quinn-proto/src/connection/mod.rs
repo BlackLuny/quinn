@@ -251,6 +251,9 @@ pub struct Connection {
 
 /// A same-peer local path stays separate from the validated active path until
 /// both reachability and the minimum QUIC datagram size have been verified.
+/// The separate amplification budget is conservative: it can require a short
+/// probe and an extra RTT even if the remote address was validated on the old
+/// local path.
 struct LocalPathCandidate {
     remote: SocketAddr,
     local_ip: IpAddr,
@@ -488,16 +491,15 @@ impl Connection {
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
         assert!(max_datagrams != 0);
-        if !self.ensure_active_cid_for_path() {
-            return None;
-        }
+        // Prefer a CID not used on another path. If none is available, keep
+        // sending with the current CID so retirement frames can reach the peer
+        // and elicit a replacement instead of deadlocking the connection.
+        let _ = self.ensure_active_cid_for_path();
         if self.local_path_candidate.as_ref().is_some_and(|candidate| {
             !self.rem_cids.spares().any(|cid| cid == candidate.cid)
         }) {
             self.cancel_local_path_candidate();
-            if !self.ensure_active_cid_for_path() {
-                return None;
-            }
+            let _ = self.ensure_active_cid_for_path();
         }
         let max_datagrams = match self.config.enable_segmentation_offload {
             false => 1,
@@ -960,7 +962,13 @@ impl Connection {
                     if builder.min_size.max(buf.len()).saturating_add(builder.tag_len) > limit {
                         trace!("discarding PATH_RESPONSE that exceeds amplification budget");
                         buf.clear();
-                        return None;
+                        // The unfinished datagram was the first and only one.
+                        // Start over so unrelated queued traffic can still go out.
+                        num_datagrams = 0;
+                        buf_capacity = 0;
+                        datagram_start = 0;
+                        coalesce = true;
+                        continue;
                     }
                     self.stats.frame_tx.path_response += 1;
                     builder.finish_and_track(
@@ -1195,7 +1203,21 @@ impl Connection {
             return true;
         }
         self.prune_local_path_cid_uses();
-        while !self.cid_usable_for_path(self.rem_cids.active(), self.path.remote, self.path.local_ip) {
+        if self.cid_usable_for_path(self.rem_cids.active(), self.path.remote, self.path.local_ip) {
+            return true;
+        }
+        self.update_rem_cid_for_path()
+    }
+
+    /// Prefer a spare that has not been used on another local path. If all
+    /// spares are path-bound, leave the active CID in place for continuity.
+    fn update_rem_cid_for_path(&mut self) -> bool {
+        let target = self.rem_cids.spares()
+            .find(|&cid| self.cid_usable_for_path(cid, self.path.remote, self.path.local_ip));
+        let Some(target) = target else {
+            return false;
+        };
+        while self.rem_cids.active() != target {
             if !self.update_rem_cid() {
                 return false;
             }
@@ -1266,6 +1288,8 @@ impl Connection {
             trace!("cannot probe a local path without an unused peer CID");
             return;
         };
+        // Probing A elicits non-probing traffic on the established path, which
+        // can cancel a spurious candidate before it is promoted.
         let old_path_challenge = self.rng.random();
         self.path.challenge = Some(old_path_challenge);
         self.path.challenge_pending = true;
@@ -3529,9 +3553,7 @@ impl Connection {
         if !is_probing_packet && number == self.spaces[SpaceId::Data].rx_packet {
             if remote != self.path.remote {
                 self.cancel_local_path_candidate();
-                if !self.ensure_active_cid_for_path() {
-                    return Ok(());
-                }
+                let _ = self.ensure_active_cid_for_path();
                 let ConnectionSide::Server { ref server_config } = self.side else {
                     panic!("packets from unknown remote should be dropped by clients");
                 };
@@ -3541,7 +3563,7 @@ impl Connection {
                 );
                 self.migrate(now, remote, local_ip);
                 // Break linkability, if possible
-                if !self.update_rem_cid() {
+                if !self.update_rem_cid_for_path() {
                     // No spare CID: the token stays, but the endpoint must look it up at the new address.
                     self.republish_reset_token();
                 }
@@ -4205,7 +4227,30 @@ impl Connection {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_blocked_local_cid(&self) -> bool {
+    pub(crate) fn test_keep_one_spare_cid(&mut self) -> frame::NewConnectionId {
+        while self.rem_cids.spares().count() > 1 {
+            assert!(self.update_rem_cid());
+        }
+        self.rem_cids.test_first_spare_frame().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reissue_cid_with_retirement(&mut self, frame: frame::NewConnectionId) {
+        self.local_cid_state.assign_retire_seq(frame.retire_prior_to);
+        self.spaces[SpaceId::Data].pending.new_cids.push(crate::shared::IssuedCid {
+            sequence: frame.sequence,
+            id: frame.id,
+            reset_token: frame.reset_token,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_send_pending_ack(&mut self) {
+        self.spaces[SpaceId::Data].pending_acks.set_immediate_ack_required();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_active_cid_used_on_another_path(&self) -> bool {
         !self.cid_usable_for_path(self.rem_cids.active(), self.path.remote, self.path.local_ip)
     }
 

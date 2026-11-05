@@ -23,7 +23,7 @@ impl RealSockets {
         // The optional socket is created in a separate network namespace by
         // the test launcher, then inherited as stdin. Cloning the descriptor is
         // safe and keeps the socket attached to the client's namespace.
-        let inherited = std::env::var_os("ZFC_TEST_INHERITED_UDP").is_some();
+        let inherited = std::env::var_os("QUINN_TEST_INHERITED_UDP").is_some();
         let (listen, ip_a, ip_b, client_ip) = if ipv6 {
             ("[::]:0", "fd00:1082::1", "fd00:1082::2", "fd00:1082::3")
         } else if inherited {
@@ -551,6 +551,201 @@ fn real_socket_local_migration(ipv6: bool, fail_validation: bool, fail_mtu_valid
     );
 }
 
+fn real_socket_cid_exhaustion_recovery(ipv6: bool) {
+    let _guard = subscribe();
+    let mut rig = RealSockets::new(ipv6);
+    let (client, server) = rig.handshake();
+    let a = rig.server_a;
+    let b = rig.server_b;
+    let remote = rig.client.local_addr().unwrap();
+    let stream = rig.pair.client_streams(client).open(Dir::Bi).unwrap();
+    assert_eq!(rig.pair.client_send(client, stream).write(b"before").unwrap(), 6);
+    rig.receive_stream_bytes(server, stream, b"before", 0, true);
+    assert_eq!(rig.pair.server_send(server, stream).write(b"ack").unwrap(), 3);
+    rig.receive_client_bytes(client, stream, b"ack", 0);
+
+    let last = rig.pair.server_conn_mut(server).test_keep_one_spare_cid();
+    rig.pair.client_conn_mut(client).ping();
+    let mut observed = Vec::new();
+    let discard: IpAddr = if ipv6 { "2001:db8::1" } else { "192.0.2.1" }.parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while rig.pair.server_conn_mut(server).test_local_path_candidate().is_none_or(|x| x.4 == 0) {
+        // Receive the candidate probes on actual sockets but withhold them
+        // from the client so no response or CID retirement is processed yet.
+        rig.pump_migration(b, false, Some(discard), &mut observed);
+        assert!(Instant::now() < deadline, "candidate CID was not used");
+        thread::sleep(StdDuration::from_millis(1));
+    }
+    assert!(observed.contains(&b.ip()));
+    assert_eq!(rig.pair.server_conn_mut(server).test_local_candidate_cid(), Some(last.id));
+
+    rig.pair.client_conn_mut(client).test_reissue_cid_with_retirement(last);
+    rig.pair.client_conn_mut(client).ping();
+    let retired_before = rig.pair.server_conn_mut(server).stats().frame_tx.retire_connection_id;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while rig.pair.server_conn_mut(server).test_remote_cids().0 != last.id {
+        rig.pump_migration(a, false, Some(a.ip()), &mut observed);
+        assert!(Instant::now() < deadline, "peer retirement was not processed");
+        thread::sleep(StdDuration::from_millis(1));
+    }
+    assert_eq!(rig.pair.server_conn_mut(server).local_ip(), Some(a.ip()));
+    assert_eq!(rig.pair.server_conn_mut(server).remote_address(), remote);
+    assert!(rig.pair.server_conn_mut(server).test_remote_cids().1.is_none());
+    assert!(rig.pair.server_conn_mut(server).test_active_cid_used_on_another_path());
+    assert!(rig.pair.server_conn_mut(server).stats().frame_tx.retire_connection_id > retired_before,
+        "the peer must receive a retirement to replenish its CID pool");
+
+    let before_reply = observed.len();
+    assert_eq!(rig.pair.server_send(server, stream).write(b"after").unwrap(), 5);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        rig.pump_migration(a, false, Some(a.ip()), &mut observed);
+        let mut recv = rig.pair.client_recv(client, stream);
+        let mut chunks = recv.read(true).unwrap();
+        let result = chunks.next(usize::MAX);
+        let _ = chunks.finalize();
+        match result {
+            Ok(Some(chunk)) => {
+                assert_eq!(chunk.offset, 3);
+                assert_eq!(chunk.bytes.as_ref(), b"after");
+                break;
+            }
+            Err(ReadError::Blocked) => {}
+            other => panic!("unexpected client stream read: {other:?}"),
+        }
+        assert!(Instant::now() < deadline, "CID exhaustion stalled the stream");
+        thread::sleep(StdDuration::from_millis(1));
+    }
+    assert!(observed[before_reply..].contains(&a.ip()));
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while rig.pair.server_conn_mut(server).test_remote_cids().0 == last.id {
+        rig.pump_migration(a, false, Some(a.ip()), &mut observed);
+        assert!(Instant::now() < deadline, "replacement CID did not restore isolation");
+        thread::sleep(StdDuration::from_millis(1));
+    }
+    assert_eq!(rig.pair.client_send(client, stream).write(b"resume").unwrap(), 6);
+    rig.receive_stream_bytes(server, stream, b"resume", 6, false);
+    assert!(!rig.pair.client_conn_mut(client).is_closed());
+    assert!(!rig.pair.server_conn_mut(server).is_closed());
+    println!(
+        "REAL_SOCKET_CID_RECOVERY client={} old={} candidate={} fallback_source={} retired=true replacement=true stream=before+after+resume connected=true",
+        remote, a, b, a.ip()
+    );
+}
+
+#[test]
+fn real_socket_1082_cid_exhaustion_nat_rebinding() {
+    let _guard = subscribe();
+    let mut rig = RealSockets::new(false);
+    let (client, server) = rig.handshake();
+    let a = rig.server_a;
+    let b = rig.server_b;
+    let old_remote = rig.client.local_addr().unwrap();
+    let stream = rig.pair.client_streams(client).open(Dir::Bi).unwrap();
+    assert_eq!(rig.pair.client_send(client, stream).write(b"before").unwrap(), 6);
+    rig.receive_stream_bytes(server, stream, b"before", 0, true);
+    assert_eq!(rig.pair.server_send(server, stream).write(b"ack").unwrap(), 3);
+    rig.receive_client_bytes(client, stream, b"ack", 0);
+
+    let last = rig.pair.server_conn_mut(server).test_keep_one_spare_cid();
+    let old_cid = rig.pair.server_conn_mut(server).test_remote_cids().0;
+    rig.pair.client_conn_mut(client).ping();
+    let mut observed = Vec::new();
+    let discard: IpAddr = "192.0.2.1".parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while rig.pair.server_conn_mut(server).test_local_path_candidate().is_none_or(|x| x.4 == 0) {
+        rig.pump_migration(b, false, Some(discard), &mut observed);
+        assert!(Instant::now() < deadline, "candidate CID was not used");
+        thread::sleep(StdDuration::from_millis(1));
+    }
+    assert!(observed.contains(&b.ip()));
+    assert_eq!(rig.pair.server_conn_mut(server).test_local_candidate_cid(), Some(last.id));
+
+    let replacement = UdpSocket::bind(SocketAddr::new(old_remote.ip(), 0)).unwrap();
+    replacement.set_nonblocking(true).unwrap();
+    let new_remote = replacement.local_addr().unwrap();
+    assert_ne!(new_remote.port(), old_remote.port());
+    let _old_socket = std::mem::replace(&mut rig.client, replacement);
+    rig.pair.client.addr = new_remote;
+    rig.pair.client_conn_mut(client).ping();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut buf = [0u8; 65536];
+    while rig.pair.server_conn_mut(server).remote_address() != new_remote {
+        let now = Instant::now();
+        rig.pair.time = now;
+        rig.pair.client.drive(now, a);
+        for (_, payload) in rig.pair.client.outbound.drain(..) {
+            assert_eq!(rig.client.send_to(&payload, a).unwrap(), payload.len());
+        }
+        loop {
+            match rig.recv_server(&mut buf) {
+                Ok(meta) => {
+                    assert_eq!(meta.addr, new_remote);
+                    assert_eq!(meta.dst_ip, Some(a.ip()));
+                    for packet in buf[..meta.len].chunks(meta.stride) {
+                        let mut scratch = Vec::new();
+                        let Some(DatagramEvent::ConnectionEvent(ch, event)) = rig.pair.server.endpoint.handle(
+                            now, meta.addr, meta.dst_ip, None, BytesMut::from(packet), &mut scratch,
+                        ) else {
+                            panic!("rebound packet must route to the connection");
+                        };
+                        rig.pair.server_conn_mut(ch).handle_event(event);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+        assert!(Instant::now() < deadline, "rebound source port was not detected");
+        thread::sleep(StdDuration::from_millis(1));
+    }
+    assert_eq!(rig.pair.server_conn_mut(server).local_ip(), Some(a.ip()));
+    assert_eq!(rig.pair.server_conn_mut(server).test_remote_cids().0, old_cid);
+    rig.pair.server_conn_mut(server).ping();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut active_sent = false;
+    while !active_sent {
+        let now = Instant::now();
+        rig.pair.time = now;
+        rig.pair.server.drive(now, new_remote);
+        let packets: Vec<_> = rig.pair.server.outbound.drain(..).collect();
+        for (tx, payload) in packets {
+            assert!(tx.destination == old_remote || tx.destination == new_remote);
+            assert_eq!(tx.src_ip, Some(a.ip()));
+            rig.send_server(&tx, &payload);
+            active_sent |= tx.destination == new_remote;
+        }
+        assert!(Instant::now() < deadline, "rebound path stalled after CID exhaustion");
+        thread::sleep(StdDuration::from_millis(1));
+    }
+    assert_eq!(rig.pair.server_send(server, stream).write(b"after").unwrap(), 5);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        rig.pump_migration(a, false, Some(a.ip()), &mut observed);
+        let mut recv = rig.pair.client_recv(client, stream);
+        let mut chunks = recv.read(true).unwrap();
+        let result = chunks.next(usize::MAX);
+        let _ = chunks.finalize();
+        match result {
+            Ok(Some(chunk)) => {
+                assert_eq!(chunk.offset, 3);
+                assert_eq!(chunk.bytes.as_ref(), b"after");
+                break;
+            }
+            Err(ReadError::Blocked) => {}
+            other => panic!("unexpected rebound stream read: {other:?}"),
+        }
+        assert!(Instant::now() < deadline, "rebound stream stalled");
+        thread::sleep(StdDuration::from_millis(1));
+    }
+    assert!(!rig.pair.client_conn_mut(client).is_closed());
+    assert!(!rig.pair.server_conn_mut(server).is_closed());
+    println!(
+        "REAL_SOCKET_CID_REBIND old_client={} new_client={} old={} candidate={} cid_preserved=true stream=before+after connected=true",
+        old_remote, new_remote, a, b
+    );
+}
+
 #[test]
 fn real_socket_1082_same_destination_control() {
     real_socket_path_response(false, false);
@@ -584,6 +779,17 @@ fn real_socket_1082_local_migration_mtu_fallback() {
 }
 
 #[test]
+fn real_socket_1082_cid_exhaustion_recovery() {
+    real_socket_cid_exhaustion_recovery(false);
+}
+
+#[test]
+#[ignore = "requires fd00:1082::1/::2/::3 in an isolated network namespace"]
+fn real_socket_1082_ipv6_cid_exhaustion_recovery() {
+    real_socket_cid_exhaustion_recovery(true);
+}
+
+#[test]
 #[ignore = "requires fd00:1082::1/::2/::3 in an isolated network namespace"]
 fn real_socket_1082_ipv6_local_migration_and_fallback() {
     real_socket_local_migration(true, false, false);
@@ -598,7 +804,7 @@ macro_rules! veth_migration_test {
         #[test]
         #[ignore = "requires a UDP socket inherited from a separate network namespace"]
         fn $name() {
-            assert!(std::env::var_os("ZFC_TEST_INHERITED_UDP").is_some());
+            assert!(std::env::var_os("QUINN_TEST_INHERITED_UDP").is_some());
             real_socket_local_migration($ipv6, $fail, $fail_mtu);
         }
     };
@@ -614,13 +820,27 @@ veth_migration_test!(real_socket_1082_veth_ipv6_mtu_fallback, true, false, true)
 #[test]
 #[ignore = "requires a UDP socket inherited from a separate network namespace"]
 fn real_socket_1082_veth_ipv4_response() {
-    assert!(std::env::var_os("ZFC_TEST_INHERITED_UDP").is_some());
+    assert!(std::env::var_os("QUINN_TEST_INHERITED_UDP").is_some());
     real_socket_path_response(true, false);
 }
 
 #[test]
 #[ignore = "requires a UDP socket inherited from a separate network namespace"]
 fn real_socket_1082_veth_ipv6_response() {
-    assert!(std::env::var_os("ZFC_TEST_INHERITED_UDP").is_some());
+    assert!(std::env::var_os("QUINN_TEST_INHERITED_UDP").is_some());
     real_socket_path_response(true, true);
+}
+
+#[test]
+#[ignore = "requires a UDP socket inherited from a separate network namespace"]
+fn real_socket_1082_veth_ipv4_cid_exhaustion_recovery() {
+    assert!(std::env::var_os("QUINN_TEST_INHERITED_UDP").is_some());
+    real_socket_cid_exhaustion_recovery(false);
+}
+
+#[test]
+#[ignore = "requires a UDP socket inherited from a separate network namespace"]
+fn real_socket_1082_veth_ipv6_cid_exhaustion_recovery() {
+    assert!(std::env::var_os("QUINN_TEST_INHERITED_UDP").is_some());
+    real_socket_cid_exhaustion_recovery(true);
 }

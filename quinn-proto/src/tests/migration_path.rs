@@ -25,6 +25,25 @@ fn receive_only(pair: &mut Pair, server_ch: ConnectionHandle) {
     }
 }
 
+fn assert_bidirectional_stream(pair: &mut Pair, client: ConnectionHandle, server: ConnectionHandle) {
+    let stream = pair.client_streams(client).open(Dir::Bi).unwrap();
+    pair.client_send(client, stream).write(b"request").unwrap();
+    pair.drive();
+    assert_eq!(pair.server_streams(server).accept(Dir::Bi), Some(stream));
+    {
+        let mut recv = pair.server_recv(server, stream);
+        let mut chunks = recv.read(true).unwrap();
+        assert_eq!(&chunks.next(usize::MAX).unwrap().unwrap().bytes[..], b"request");
+        let _ = chunks.finalize();
+    }
+    pair.server_send(server, stream).write(b"response").unwrap();
+    pair.drive();
+    let mut recv = pair.client_recv(client, stream);
+    let mut chunks = recv.read(true).unwrap();
+    assert_eq!(&chunks.next(usize::MAX).unwrap().unwrap().bytes[..], b"response");
+    let _ = chunks.finalize();
+}
+
 #[test]
 fn migration_rearms_loss_timer_for_new_path() {
     let _guard = subscribe();
@@ -471,12 +490,138 @@ fn local_candidate_cid_is_not_reused_if_peer_retires_active_cid() {
     assert_eq!(pair.server_conn_mut(server).local_ip(), Some(old_ip));
     assert!(pair.server_conn_mut(server).test_local_path_candidate().is_none());
     if pair.server_conn_mut(server).test_remote_cids().0 == used {
-        assert!(tx.is_none());
-        assert!(pair.server_conn_mut(server).test_blocked_local_cid());
+        assert!(tx.is_some(), "CID exhaustion must not stop active-path traffic");
+        assert!(pair.server_conn_mut(server).test_active_cid_used_on_another_path());
     } else {
-        assert!(!pair.server_conn_mut(server).test_blocked_local_cid());
+        assert!(!pair.server_conn_mut(server).test_active_cid_used_on_another_path());
     }
     assert!(!pair.server_conn_mut(server).is_closed());
+}
+
+#[test]
+fn cid_exhaustion_remote_rebinding_preserves_stream() {
+    let _guard = subscribe();
+    let old_ip: IpAddr = "127.0.0.1".parse().unwrap();
+    let candidate_ip: IpAddr = "127.0.0.2".parse().unwrap();
+    let mut pair = Pair::default();
+    pair.client.addr = "127.0.0.3:4567".parse().unwrap();
+    pair.server.local_ip = Some(old_ip);
+    let (client, server) = pair.connect();
+    pair.drive();
+    let only_spare = pair.server_conn_mut(server).test_keep_one_spare_cid();
+    let previous_cid = pair.server_conn_mut(server).test_remote_cids().0;
+
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.server.local_ip = Some(candidate_ip);
+    receive_only(&mut pair, server);
+    assert_eq!(pair.server_conn_mut(server).test_local_candidate_cid(), Some(only_spare.id));
+    let now = pair.time;
+    let mut output = Vec::new();
+    let tx = pair.server_conn_mut(server).poll_transmit(now, 1, &mut output).unwrap();
+    assert_eq!(tx.src_ip, Some(candidate_ip));
+
+    let rebound: SocketAddr = "127.0.0.3:4568".parse().unwrap();
+    pair.client.addr = rebound;
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.server.local_ip = Some(old_ip);
+    receive_only(&mut pair, server);
+    assert_eq!(pair.server_conn_mut(server).remote_address(), rebound);
+    assert_eq!(pair.server_conn_mut(server).local_ip(), Some(old_ip));
+    assert_eq!(pair.server_conn_mut(server).test_remote_cids().0, previous_cid,
+        "reuse the existing same-local CID instead of a CID used on B");
+    let before = pair.client_conn_mut(client).stats().frame_rx.ping;
+    pair.server_conn_mut(server).ping();
+    pair.drive_server();
+    assert!(!pair.client.inbound.is_empty(), "rebound path must remain sendable");
+    pair.drive();
+    assert!(pair.client_conn_mut(client).stats().frame_rx.ping > before);
+    assert!(!pair.server_conn_mut(server).is_closed());
+    assert!(!pair.client_conn_mut(client).is_closed());
+    assert_bidirectional_stream(&mut pair, client, server);
+}
+
+#[test]
+fn cid_exhaustion_forced_retirement_recovers_after_peer_replenishes() {
+    let _guard = subscribe();
+    let old_ip: IpAddr = "127.0.0.1".parse().unwrap();
+    let candidate_ip: IpAddr = "127.0.0.2".parse().unwrap();
+    let mut pair = Pair::default();
+    pair.client.addr = "127.0.0.3:4567".parse().unwrap();
+    pair.server.local_ip = Some(old_ip);
+    let (client, server) = pair.connect();
+    pair.drive();
+    let only_spare = pair.server_conn_mut(server).test_keep_one_spare_cid();
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.server.local_ip = Some(candidate_ip);
+    receive_only(&mut pair, server);
+    let now = pair.time;
+    let mut output = Vec::new();
+    let tx = pair.server_conn_mut(server).poll_transmit(now, 1, &mut output).unwrap();
+    assert_eq!(tx.src_ip, Some(candidate_ip));
+
+    // Reissue the existing last CID with a higher retire_prior_to, without
+    // issuing a fresh CID. The frame is protected and sent by the real peer.
+    pair.client_conn_mut(client).test_reissue_cid_with_retirement(only_spare);
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.server.local_ip = Some(old_ip);
+    receive_only(&mut pair, server);
+    assert_eq!(pair.server_conn_mut(server).test_remote_cids().0, only_spare.id);
+    assert!(pair.server_conn_mut(server).test_remote_cids().1.is_none());
+    let retired_before = pair.server_conn_mut(server).stats().frame_tx.retire_connection_id;
+    let acks_before = pair.server_conn_mut(server).stats().frame_tx.acks;
+    let ping_before = pair.client_conn_mut(client).stats().frame_rx.ping;
+    pair.server_conn_mut(server).test_send_pending_ack();
+    pair.server_conn_mut(server).ping();
+    pair.drive_server();
+    assert!(!pair.client.inbound.is_empty(), "retirement and data must not be blocked");
+    pair.drive();
+    assert!(pair.server_conn_mut(server).stats().frame_tx.retire_connection_id > retired_before);
+    assert!(pair.server_conn_mut(server).stats().frame_tx.acks > acks_before);
+    assert!(pair.client_conn_mut(client).stats().frame_rx.ping > ping_before);
+    assert_ne!(pair.server_conn_mut(server).test_remote_cids().0, only_spare.id,
+        "the peer's replacement CID must restore path isolation");
+    assert!(!pair.server_conn_mut(server).is_closed());
+    assert!(!pair.client_conn_mut(client).is_closed());
+    assert_bidirectional_stream(&mut pair, client, server);
+}
+
+#[test]
+fn cid_exhaustion_does_not_block_connection_close() {
+    let _guard = subscribe();
+    let old_ip: IpAddr = "127.0.0.1".parse().unwrap();
+    let candidate_ip: IpAddr = "127.0.0.2".parse().unwrap();
+    let mut pair = Pair::default();
+    pair.client.addr = "127.0.0.3:4567".parse().unwrap();
+    pair.server.local_ip = Some(old_ip);
+    let (client, server) = pair.connect();
+    pair.drive();
+    let last = pair.server_conn_mut(server).test_keep_one_spare_cid();
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.server.local_ip = Some(candidate_ip);
+    receive_only(&mut pair, server);
+    let now = pair.time;
+    let mut output = Vec::new();
+    assert_eq!(pair.server_conn_mut(server).poll_transmit(now, 1, &mut output).unwrap().src_ip,
+        Some(candidate_ip));
+    pair.client_conn_mut(client).test_reissue_cid_with_retirement(last);
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.server.local_ip = Some(old_ip);
+    receive_only(&mut pair, server);
+    assert_eq!(pair.server_conn_mut(server).test_remote_cids(), (last.id, None));
+    assert!(pair.server_conn_mut(server).test_active_cid_used_on_another_path());
+
+    let closes_before = pair.client_conn_mut(client).stats().frame_rx.connection_close;
+    pair.server_conn_mut(server).close(now, VarInt::from_u32(7), Bytes::from_static(b"test"));
+    pair.drive_server();
+    assert!(!pair.client.inbound.is_empty(), "connection close must be transmitted");
+    pair.drive();
+    assert!(pair.client_conn_mut(client).stats().frame_rx.connection_close > closes_before);
 }
 
 #[test]
