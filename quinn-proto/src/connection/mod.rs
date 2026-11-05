@@ -152,6 +152,8 @@ pub struct Connection {
     prev_path: Option<(ConnectionId, PathData)>,
     /// A different local destination is probed before replacing the active path.
     local_path_candidate: Option<LocalPathCandidate>,
+    /// Recently unsuccessful local paths, bounded per connection.
+    local_path_backoffs: Vec<LocalPathBackoff>,
     /// CIDs used on candidate paths, retained until the CID queue retires them.
     local_path_cid_uses: Vec<LocalPathCidUse>,
     /// Whether the application replaced the congestion controller
@@ -273,6 +275,13 @@ struct LocalPathCidUse {
     local_ip: Option<IpAddr>,
 }
 
+struct LocalPathBackoff {
+    remote: SocketAddr,
+    local_ip: IpAddr,
+    failures: u32,
+    retry_at: Instant,
+}
+
 impl Connection {
     pub(crate) fn new(
         endpoint_config: Arc<EndpointConfig>,
@@ -320,6 +329,7 @@ impl Connection {
             allow_mtud,
             prev_path: None,
             local_path_candidate: None,
+            local_path_backoffs: Vec::new(),
             local_path_cid_uses: Vec::new(),
             app_congestion: false,
             state,
@@ -621,6 +631,33 @@ impl Connection {
                 continue;
             }
 
+            // The previous response may have been discarded in this loop,
+            // exposing a new queue entry that the initial filter did not see.
+            // Resolve its CID before allocating a datagram or consuming a probe.
+            let off_path_cid = if !close
+                && space_id == SpaceId::Data
+                && num_datagrams == 0
+                && buf.is_empty()
+            {
+                if let Some((remote, local_ip, _)) = self
+                    .path_responses
+                    .peek_off_path(self.path.remote, self.path.local_ip)
+                {
+                    let Some(cid) = self.off_path_response_cid(remote, local_ip) else {
+                        trace!("discarding PATH_RESPONSE without an unused peer CID");
+                        let _ = self
+                            .path_responses
+                            .pop_off_path(self.path.remote, self.path.local_ip);
+                        continue;
+                    };
+                    Some(cid)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let mut ack_eliciting = !self.spaces[space_id].pending.is_empty(&self.streams)
                 || self.spaces[space_id].ping_pending
                 || self.spaces[space_id].immediate_ack_pending;
@@ -846,17 +883,7 @@ impl Connection {
                 "Previous packet must have been finished"
             );
 
-            let cid = if !close && space_id == SpaceId::Data && num_datagrams == 1 && buf.is_empty() {
-                self.path_responses
-                    .peek_off_path(self.path.remote, self.path.local_ip)
-                    .map(|(remote, local_ip, _)| {
-                        self.off_path_response_cid(remote, local_ip)
-                            .expect("off-path responses without a suitable CID were removed")
-                    })
-                    .unwrap_or_else(|| self.rem_cids.active())
-            } else {
-                self.rem_cids.active()
-            };
+            let cid = off_path_cid.unwrap_or_else(|| self.rem_cids.active());
             let builder = builder_storage.insert(PacketBuilder::new(
                 now,
                 space_id,
@@ -1273,13 +1300,61 @@ impl Connection {
         }
     }
 
+    fn record_local_path_failure(&mut self, now: Instant, remote: SocketAddr, local_ip: IpAddr) {
+        let previous = self
+            .local_path_backoffs
+            .iter()
+            .position(|entry| entry.remote == remote && entry.local_ip == local_ip)
+            .map(|index| self.local_path_backoffs.remove(index));
+        let failures = previous.map_or(1, |entry| {
+            if now >= entry.retry_at + LOCAL_PATH_MAX_BACKOFF {
+                1
+            } else {
+                entry
+                    .failures
+                    .saturating_add(1)
+                    .min(LOCAL_PATH_MAX_BACKOFF_EXPONENT + 1)
+            }
+        });
+        let delay = self
+            .local_path_probe_interval()
+            .min(LOCAL_PATH_MAX_BACKOFF)
+            .saturating_mul(1 << (failures - 1))
+            .min(LOCAL_PATH_MAX_BACKOFF);
+        if self.local_path_backoffs.len() == MAX_LOCAL_PATH_BACKOFFS {
+            self.local_path_backoffs.remove(0);
+        }
+        self.local_path_backoffs.push(LocalPathBackoff {
+            remote,
+            local_ip,
+            failures,
+            retry_at: now + delay,
+        });
+    }
+
+    fn cancel_unpreferred_local_path_candidate(&mut self, now: Instant) {
+        if let Some(candidate) = self
+            .local_path_candidate
+            .as_ref()
+            .filter(|candidate| candidate.total_sent != 0)
+        {
+            self.record_local_path_failure(now, candidate.remote, candidate.local_ip);
+        }
+        self.cancel_local_path_candidate();
+    }
+
     fn start_local_path_candidate(&mut self, now: Instant, remote: SocketAddr, local_ip: IpAddr) {
         if self.local_path_candidate.as_ref().is_some_and(|candidate| {
             candidate.remote == remote && candidate.local_ip == local_ip
         }) {
             return;
         }
-        self.cancel_local_path_candidate();
+        if self.local_path_backoffs.iter().any(|entry| {
+            entry.remote == remote && entry.local_ip == local_ip && now < entry.retry_at
+        }) {
+            return;
+        }
+        self.cancel_unpreferred_local_path_candidate(now);
         if !self.ensure_active_cid_for_path() {
             return;
         }
@@ -1349,6 +1424,8 @@ impl Connection {
                 return true;
             }
         }
+        self.local_path_backoffs
+            .retain(|entry| entry.remote != remote || entry.local_ip != local_ip);
         self.prune_local_path_cid_uses();
         self.set_loss_detection_timer(now);
         self.spin = false;
@@ -1619,6 +1696,9 @@ impl Connection {
                 }
                 Timer::LocalPathValidation => {
                     trace!("candidate local path validation failed; keeping the active path");
+                    if let Some(candidate) = self.local_path_candidate.as_ref() {
+                        self.record_local_path_failure(now, candidate.remote, candidate.local_ip);
+                    }
                     self.cancel_local_path_candidate();
                 }
                 Timer::LocalPathProbe => {
@@ -3587,7 +3667,7 @@ impl Connection {
                         self.start_local_path_candidate(now, remote, received);
                     }
                     (Some(active), Some(received)) if active == received && self.local_path_candidate.is_some() => {
-                        self.cancel_local_path_candidate();
+                        self.cancel_unpreferred_local_path_candidate(now);
                     }
                     _ => {} // Missing local metadata cannot select a path.
                 }
@@ -4217,6 +4297,23 @@ impl Connection {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_local_path_backoff(
+        &self,
+        remote: SocketAddr,
+        local_ip: IpAddr,
+    ) -> Option<(u32, Instant)> {
+        self.local_path_backoffs
+            .iter()
+            .find(|entry| entry.remote == remote && entry.local_ip == local_ip)
+            .map(|entry| (entry.failures, entry.retry_at))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_local_path_backoff_count(&self) -> usize {
+        self.local_path_backoffs.len()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_path_validation_state(&self) -> (bool, bool) {
         (self.path.validated, self.path.challenge.is_some())
     }
@@ -4724,6 +4821,11 @@ fn get_max_ack_delay(params: &TransportParameters) -> Duration {
 
 // Prevents overflow and improves behavior in extreme circumstances
 const MAX_BACKOFF_EXPONENT: u32 = 16;
+
+// Bound both per-connection memory and retries for a persistently broken local path.
+const MAX_LOCAL_PATH_BACKOFFS: usize = 8;
+const LOCAL_PATH_MAX_BACKOFF_EXPONENT: u32 = 6;
+const LOCAL_PATH_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Minimal remaining size to allow packet coalescing, excluding cryptographic tag
 ///

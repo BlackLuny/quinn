@@ -307,7 +307,8 @@ fn repeated_local_path_failures_preserve_connection_and_cid_capacity() {
     pair.server.local_ip = Some(old_ip);
     let (client, server) = pair.connect();
     pair.drive();
-    for round in 0..6 {
+    let mut previous_delay = Duration::ZERO;
+    for round in 0..8 {
         pair.client_conn_mut(client).ping();
         pair.drive_client();
         pair.server.local_ip = Some(new_ip);
@@ -328,12 +329,186 @@ fn repeated_local_path_failures_preserve_connection_and_cid_capacity() {
         }
         assert!(pair.server_conn_mut(server).test_local_path_candidate().is_none());
         assert_eq!(pair.server_conn_mut(server).local_ip(), Some(old_ip));
+        let remote = pair.client.addr;
+        let (failures, retry) = pair.server_conn_mut(server)
+            .test_local_path_backoff(remote, new_ip).unwrap();
+        let delay = retry.duration_since(pair.time);
+        assert_eq!(failures, (round + 1).min(7));
+        assert!(delay <= Duration::from_secs(60));
+        assert!(delay > previous_delay || delay == Duration::from_secs(60),
+            "each repeated failure should increase the delay until its cap");
+        previous_delay = delay;
         pair.server.local_ip = Some(old_ip);
         pair.client.inbound.clear();
         pair.drive(); // Deliver CID retirements and peer replacements on A.
         assert!(!pair.server_conn_mut(server).is_closed(), "round {round}");
         assert!(!pair.client_conn_mut(client).is_closed(), "round {round}");
+        // Keep the connection active while traffic continues to reach B.
+        while pair.time + Duration::from_secs(5) < retry {
+            pair.time += Duration::from_secs(5);
+            pair.server.local_ip = Some(new_ip);
+            pair.client_conn_mut(client).ping();
+            pair.drive();
+            assert!(pair.server_conn_mut(server).test_local_path_candidate().is_none());
+        }
+        pair.time = pair.time.max(retry);
     }
+}
+
+#[test]
+fn failed_local_path_does_not_restart_on_next_packet() {
+    let _guard = subscribe();
+    let a: IpAddr = "127.0.0.1".parse().unwrap();
+    let b: IpAddr = "127.0.0.2".parse().unwrap();
+    let mut pair = Pair::default();
+    pair.client.addr = "127.0.0.3:4567".parse().unwrap();
+    pair.server.local_ip = Some(a);
+    let (client, server) = pair.connect();
+    pair.drive();
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.server.local_ip = Some(b);
+    receive_only(&mut pair, server);
+    assert!(pair.server_conn_mut(server).test_local_path_candidate().is_some());
+    for _ in 0..200 {
+        pair.drive_server();
+        pair.client.inbound.clear();
+        if pair.server_conn_mut(server).test_local_path_candidate().is_none() {
+            break;
+        }
+        let deadline = pair.server_conn_mut(server).poll_timeout().unwrap();
+        pair.time = pair.time.max(deadline);
+    }
+    assert!(pair.server_conn_mut(server).test_local_path_candidate().is_none());
+    pair.server.local_ip = Some(a);
+    pair.client.inbound.clear();
+    pair.drive(); // Replenish retired CIDs over the active path.
+    let remote = pair.client.addr;
+    let (failures, retry_at) = pair.server_conn_mut(server)
+        .test_local_path_backoff(remote, b).expect("timeout must schedule a retry");
+    assert_eq!(failures, 1);
+    assert!(retry_at > pair.time, "the cooldown must outlast immediate traffic");
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.server.local_ip = Some(b);
+    receive_only(&mut pair, server);
+    assert!(pair.server_conn_mut(server).test_local_path_candidate().is_none(),
+        "a failed path must not restart validation on the next packet");
+    assert_eq!(pair.server_conn_mut(server).local_ip(), Some(a));
+    assert!(!pair.server_conn_mut(server).is_closed());
+
+    // Once the deadline passes, a new packet may retry and a working path can
+    // validate. Successful promotion must clear the history for this tuple.
+    pair.time = retry_at;
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    receive_only(&mut pair, server);
+    assert!(pair.server_conn_mut(server).test_local_path_candidate().is_some());
+    pair.drive();
+    assert_eq!(pair.server_conn_mut(server).local_ip(), Some(b));
+    assert!(pair.server_conn_mut(server).test_local_path_backoff(remote, b).is_none());
+    assert_bidirectional_stream(&mut pair, client, server);
+}
+
+#[test]
+fn local_path_backoff_is_scoped_to_the_failed_destination() {
+    let _guard = subscribe();
+    let a: IpAddr = "127.0.0.1".parse().unwrap();
+    let b: IpAddr = "127.0.0.2".parse().unwrap();
+    let c: IpAddr = "127.0.0.4".parse().unwrap();
+    let mut pair = Pair::default();
+    pair.client.addr = "127.0.0.3:4567".parse().unwrap();
+    pair.server.local_ip = Some(a);
+    let (client, server) = pair.connect();
+    pair.drive();
+    let remote = pair.client.addr;
+
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.server.local_ip = Some(b);
+    receive_only(&mut pair, server);
+    pair.drive_server();
+    pair.client.inbound.clear();
+    assert!(pair.server_conn_mut(server).test_local_path_candidate().unwrap().4 > 0);
+
+    // Fresh business traffic on A cancels a probed B. Alternation must not
+    // immediately recreate B and churn another set of CIDs.
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.server.local_ip = Some(a);
+    receive_only(&mut pair, server);
+    assert!(pair.server_conn_mut(server).test_local_path_candidate().is_none());
+    assert!(pair.server_conn_mut(server).test_local_path_backoff(remote, b).is_some());
+
+    // C remains eligible, and packets from B during its cooldown do not
+    // cancel a candidate that is already being validated for C.
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.server.local_ip = Some(c);
+    receive_only(&mut pair, server);
+    let candidate = pair.server_conn_mut(server).test_local_candidate_cid().unwrap();
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.server.local_ip = Some(b);
+    receive_only(&mut pair, server);
+    assert_eq!(pair.server_conn_mut(server).test_local_candidate_cid(), Some(candidate));
+    assert_eq!(pair.server_conn_mut(server).local_ip(), Some(a));
+    assert!(!pair.server_conn_mut(server).is_closed());
+
+    // The same local B on a different remote tuple is independent too.
+    pair.server.local_ip = Some(c);
+    pair.drive();
+    assert_eq!(pair.server_conn_mut(server).local_ip(), Some(c));
+    let rebound: SocketAddr = "127.0.0.3:4568".parse().unwrap();
+    pair.client.addr = rebound;
+    pair.client_conn_mut(client).ping();
+    pair.drive();
+    assert_eq!(pair.server_conn_mut(server).remote_address(), rebound);
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.server.local_ip = Some(b);
+    receive_only(&mut pair, server);
+    assert!(pair.server_conn_mut(server).test_local_path_candidate().is_some(),
+        "a failed tuple must not back off the same local IP for a different remote");
+}
+
+#[test]
+fn local_path_backoff_history_is_bounded() {
+    let _guard = subscribe();
+    let a: IpAddr = "127.0.0.1".parse().unwrap();
+    let mut pair = Pair::default();
+    pair.client.addr = "127.0.0.3:4567".parse().unwrap();
+    pair.server.local_ip = Some(a);
+    let (client, server) = pair.connect();
+    pair.drive();
+    let remote = pair.client.addr;
+    for octet in 10..22 {
+        let target = IpAddr::V4(Ipv4Addr::new(127, 0, 0, octet));
+        pair.client_conn_mut(client).ping();
+        pair.drive_client();
+        pair.server.local_ip = Some(target);
+        receive_only(&mut pair, server);
+        assert!(pair.server_conn_mut(server).test_local_path_candidate().is_some());
+        for _ in 0..200 {
+            pair.drive_server();
+            pair.client.inbound.clear();
+            if pair.server_conn_mut(server).test_local_path_candidate().is_none() {
+                break;
+            }
+            let deadline = pair.server_conn_mut(server).poll_timeout().unwrap();
+            pair.time = pair.time.max(deadline);
+        }
+        assert!(pair.server_conn_mut(server).test_local_path_candidate().is_none());
+        assert!(pair.server_conn_mut(server).test_local_path_backoff(remote, target).is_some());
+        assert!(pair.server_conn_mut(server).test_local_path_backoff_count() <= 8);
+        pair.server.local_ip = Some(a);
+        pair.client.inbound.clear();
+        pair.drive();
+    }
+    assert_eq!(pair.server_conn_mut(server).test_local_path_backoff_count(), 8);
+    let oldest = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 10));
+    assert!(pair.server_conn_mut(server).test_local_path_backoff(remote, oldest).is_none());
+    assert!(!pair.server_conn_mut(server).is_closed());
 }
 
 #[test]
@@ -773,6 +948,8 @@ fn local_path_probe_without_spare_cid_does_not_reuse_active_cid() {
     pair.drive_client();
     pair.server.local_ip = Some(new_ip);
     receive_only(&mut pair, server);
+    let before_ping = pair.server_conn_mut(server).stats().frame_tx.ping;
+    pair.server_conn_mut(server).ping();
     let mut buf = Vec::new();
     let now = pair.time;
     while let Some(tx) = pair.server_conn_mut(server).poll_transmit(now, 1, &mut buf) {
@@ -780,6 +957,8 @@ fn local_path_probe_without_spare_cid_does_not_reuse_active_cid() {
         buf.clear();
     }
     assert_eq!(pair.server_conn_mut(server).stats().frame_tx.path_response, before);
+    assert!(pair.server_conn_mut(server).stats().frame_tx.ping > before_ping,
+        "discarding an unusable response must not block active-path traffic");
     assert_eq!(pair.server_conn_mut(server).local_ip(), Some(old_ip));
     assert!(!pair.server_conn_mut(server).is_closed());
 }

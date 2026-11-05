@@ -551,6 +551,113 @@ fn real_socket_local_migration(ipv6: bool, fail_validation: bool, fail_mtu_valid
     );
 }
 
+fn real_socket_local_path_backoff(ipv6: bool) {
+    let _guard = subscribe();
+    let mut rig = RealSockets::new(ipv6);
+    let (client, server) = rig.handshake();
+    let a = rig.server_a;
+    let b = rig.server_b;
+    let remote = rig.client.local_addr().unwrap();
+    let stream = rig.pair.client_streams(client).open(Dir::Bi).unwrap();
+    assert_eq!(rig.pair.client_send(client, stream).write(b"before").unwrap(), 6);
+    rig.receive_stream_bytes(server, stream, b"before", 0, true);
+    assert_eq!(rig.pair.server_send(server, stream).write(b"ack").unwrap(), 3);
+    rig.receive_client_bytes(client, stream, b"ack", 0);
+
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut observed = Vec::new();
+    let mut delays = Vec::new();
+    let mut live_stream = false;
+    let mut next_ping = Instant::now();
+    while delays.len() < 2 {
+        let now = Instant::now();
+        if now >= next_ping {
+            rig.pair.client_conn_mut(client).ping();
+            next_ping = now + Duration::from_millis(50);
+        }
+        // Client traffic reaches B, but packets sent from B are dropped before
+        // the client can answer. Packets from the active path A still work.
+        rig.pump_migration(b, false, Some(a.ip()), &mut observed);
+        let backoff = rig.pair.server_conn_mut(server).test_local_path_backoff(remote, b.ip());
+        if let Some((failures, retry_at)) = backoff.filter(|(failures, _)| *failures > delays.len() as u32) {
+            assert!(rig.pair.server_conn_mut(server).test_local_path_candidate().is_none());
+            let remaining = retry_at.saturating_duration_since(Instant::now());
+            assert!(remaining >= Duration::from_millis(if failures == 1 { 500 } else { 1200 }));
+            delays.push(remaining);
+            let challenges = rig.pair.server_conn_mut(server).stats().frame_tx.path_challenge;
+            if failures == 1 {
+                assert_eq!(rig.pair.server_send(server, stream).write(b"alive").unwrap(), 5);
+            }
+            while Instant::now() + Duration::from_millis(100) < retry_at {
+                rig.pair.client_conn_mut(client).ping();
+                rig.pump_migration(b, false, Some(a.ip()), &mut observed);
+                assert!(rig.pair.server_conn_mut(server).test_local_path_candidate().is_none(),
+                    "continuous B traffic must not bypass the cooldown");
+                assert_eq!(rig.pair.server_conn_mut(server).local_ip(), Some(a.ip()));
+                if failures == 1 && !live_stream {
+                    let mut recv = rig.pair.client_recv(client, stream);
+                    let mut chunks = recv.read(true).unwrap();
+                    let result = chunks.next(usize::MAX);
+                    let _ = chunks.finalize();
+                    match result {
+                        Ok(Some(chunk)) => {
+                            assert_eq!(chunk.offset, 3);
+                            assert_eq!(chunk.bytes.as_ref(), b"alive");
+                            live_stream = true;
+                        }
+                        Err(ReadError::Blocked) => {}
+                        other => panic!("unexpected active-path stream read: {other:?}"),
+                    }
+                }
+                thread::sleep(StdDuration::from_millis(20));
+            }
+            assert_eq!(rig.pair.server_conn_mut(server).stats().frame_tx.path_challenge, challenges,
+                "cooldown must not emit more path challenges");
+        }
+        assert!(Instant::now() < deadline, "two local-path timeouts did not complete");
+        thread::sleep(StdDuration::from_millis(5));
+    }
+    assert!(live_stream, "the original path must keep its existing stream usable");
+    assert!(delays[1] > delays[0], "the second cooldown must grow");
+
+    // Restore B-to-client traffic. A fresh packet after the retry deadline
+    // must validate B and preserve the same bidirectional stream.
+    while rig.pair.server_conn_mut(server).local_ip() != Some(b.ip()) {
+        rig.pair.client_conn_mut(client).ping();
+        rig.pump_migration(b, false, None, &mut observed);
+        assert!(Instant::now() < deadline, "B did not recover after its cooldown");
+        thread::sleep(StdDuration::from_millis(5));
+    }
+    assert!(rig.pair.server_conn_mut(server).test_local_path_backoff(remote, b.ip()).is_none());
+    assert_eq!(rig.pair.server_send(server, stream).write(b"ok").unwrap(), 2);
+    let after_switch = observed.len();
+    loop {
+        rig.pump_migration(b, false, None, &mut observed);
+        let mut recv = rig.pair.client_recv(client, stream);
+        let mut chunks = recv.read(true).unwrap();
+        let result = chunks.next(usize::MAX);
+        let _ = chunks.finalize();
+        match result {
+            Ok(Some(chunk)) => {
+                assert_eq!(chunk.offset, 8);
+                assert_eq!(chunk.bytes.as_ref(), b"ok");
+                break;
+            }
+            Err(ReadError::Blocked) => {}
+            other => panic!("unexpected recovered-path stream read: {other:?}"),
+        }
+        assert!(Instant::now() < deadline, "recovered stream timed out");
+        thread::sleep(StdDuration::from_millis(5));
+    }
+    assert!(observed[after_switch..].contains(&b.ip()));
+    assert!(!rig.pair.client_conn_mut(client).is_closed());
+    assert!(!rig.pair.server_conn_mut(server).is_closed());
+    println!(
+        "REAL_SOCKET_BACKOFF client={} old={} candidate={} cooldown_ms={}/{} continuous_b=true stream_a=alive recovered_b=true stream_b=ok connected=true",
+        remote, a, b, delays[0].as_millis(), delays[1].as_millis()
+    );
+}
+
 fn real_socket_cid_exhaustion_recovery(ipv6: bool) {
     let _guard = subscribe();
     let mut rig = RealSockets::new(ipv6);
@@ -779,6 +886,17 @@ fn real_socket_1082_local_migration_mtu_fallback() {
 }
 
 #[test]
+fn real_socket_1082_local_path_backoff() {
+    real_socket_local_path_backoff(false);
+}
+
+#[test]
+#[ignore = "requires fd00:1082::1/::2/::3 in an isolated network namespace"]
+fn real_socket_1082_ipv6_local_path_backoff() {
+    real_socket_local_path_backoff(true);
+}
+
+#[test]
 fn real_socket_1082_cid_exhaustion_recovery() {
     real_socket_cid_exhaustion_recovery(false);
 }
@@ -843,4 +961,18 @@ fn real_socket_1082_veth_ipv4_cid_exhaustion_recovery() {
 fn real_socket_1082_veth_ipv6_cid_exhaustion_recovery() {
     assert!(std::env::var_os("QUINN_TEST_INHERITED_UDP").is_some());
     real_socket_cid_exhaustion_recovery(true);
+}
+
+#[test]
+#[ignore = "requires a UDP socket inherited from a separate network namespace"]
+fn real_socket_1082_veth_ipv4_local_path_backoff() {
+    assert!(std::env::var_os("QUINN_TEST_INHERITED_UDP").is_some());
+    real_socket_local_path_backoff(false);
+}
+
+#[test]
+#[ignore = "requires a UDP socket inherited from a separate network namespace"]
+fn real_socket_1082_veth_ipv6_local_path_backoff() {
+    assert!(std::env::var_os("QUINN_TEST_INHERITED_UDP").is_some());
+    real_socket_local_path_backoff(true);
 }
