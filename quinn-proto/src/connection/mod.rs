@@ -501,6 +501,23 @@ impl Connection {
             _ => false,
         };
 
+        // Each off-path response is funded only by the authenticated packet that
+        // carried its challenge. Drop responses too small to fit, rather than
+        // spinning on work that cannot satisfy the amplification limit.
+        while let Some((remote, limit)) = self
+            .path_responses
+            .peek_off_path(self.path.remote, self.path.local_ip)
+        {
+            let limit = self.off_path_response_limit(remote, limit);
+            if limit >= self.predict_1rtt_overhead(None).saturating_add(9) {
+                break;
+            }
+            trace!("discarding PATH_RESPONSE with insufficient amplification budget");
+            let _ = self
+                .path_responses
+                .pop_off_path(self.path.remote, self.path.local_ip);
+        }
+
         // Check whether we need to send an ACK_FREQUENCY frame
         if let Some(config) = &self.config.ack_frequency_config {
             self.spaces[SpaceId::Data].pending.ack_frequency = self
@@ -853,9 +870,13 @@ impl Connection {
 
             // Send an off-path PATH_RESPONSE. Prioritized over on-path data to ensure that path
             // validation can occur while the link is saturated.
-            if space_id == SpaceId::Data && num_datagrams == 1 {
-                if let Some((token, remote, local_ip)) =
-                    self.path_responses.pop_off_path(self.path.remote)
+            if space_id == SpaceId::Data
+                && num_datagrams == 1
+                && builder.partial_encode.start == 0
+            {
+                if let Some((token, remote, local_ip, limit)) = self
+                    .path_responses
+                    .pop_off_path(self.path.remote, self.path.local_ip)
                 {
                     // `unwrap` guaranteed to succeed because `builder_storage` was populated just
                     // above.
@@ -863,8 +884,18 @@ impl Connection {
                     trace!("PATH_RESPONSE {:08x} (off-path)", token);
                     buf.write(frame::FrameType::PATH_RESPONSE);
                     buf.write(token);
+                    let limit = self.off_path_response_limit(remote, limit);
+                    // RFC 9000 permits omitting padding when it would exceed the
+                    // anti-amplification budget for this path.
+                    if limit >= MIN_INITIAL_SIZE as usize {
+                        builder.pad_to(MIN_INITIAL_SIZE);
+                    }
+                    if builder.min_size.max(buf.len()).saturating_add(builder.tag_len) > limit {
+                        trace!("discarding PATH_RESPONSE that exceeds amplification budget");
+                        buf.clear();
+                        return None;
+                    }
                     self.stats.frame_tx.path_response += 1;
-                    builder.pad_to(MIN_INITIAL_SIZE);
                     builder.finish_and_track(
                         now,
                         self,
@@ -874,6 +905,10 @@ impl Connection {
                         }),
                         buf,
                     );
+                    if remote == self.path.remote {
+                        self.path.total_sent =
+                            self.path.total_sent.saturating_add(buf.len() as u64);
+                    }
                     self.stats.udp_tx.on_sent(1, buf.len());
                     return Some(Transmit {
                         destination: remote,
@@ -1015,6 +1050,18 @@ impl Connection {
             },
             src_ip: self.path.local_ip,
         })
+    }
+
+    fn off_path_response_limit(&self, remote: SocketAddr, limit: usize) -> usize {
+        if remote != self.path.remote || self.path.validated {
+            return limit;
+        }
+        let remaining = self
+            .path
+            .total_recvd
+            .saturating_mul(3)
+            .saturating_sub(self.path.total_sent);
+        limit.min(usize::try_from(remaining).unwrap_or(usize::MAX))
     }
 
     /// Send PATH_CHALLENGE for a previous path if necessary
@@ -2059,7 +2106,14 @@ impl Connection {
         );
 
         let local_ip = self.path.local_ip;
-        self.process_decrypted_packet(now, remote, local_ip, Some(packet_number), packet.into())?;
+        self.process_decrypted_packet(
+            now,
+            remote,
+            local_ip,
+            Some(packet_number),
+            len,
+            packet.into(),
+        )?;
         if let Some(data) = remaining {
             self.handle_coalesced(now, remote, local_ip, ecn, data);
         }
@@ -2326,6 +2380,9 @@ impl Connection {
 
         let was_closed = self.state.is_closed();
         let was_drained = self.state.is_drained();
+        let received_len = packet
+            .as_ref()
+            .map_or(0, |p| p.header_data.len().saturating_add(p.payload.len()));
 
         let decrypted = match packet {
             None => Err(None),
@@ -2401,7 +2458,14 @@ impl Connection {
                         );
                     }
 
-                    self.process_decrypted_packet(now, remote, local_ip, number, packet)
+                    self.process_decrypted_packet(
+                        now,
+                        remote,
+                        local_ip,
+                        number,
+                        received_len,
+                        packet,
+                    )
                 }
             }
         };
@@ -2459,13 +2523,21 @@ impl Connection {
         remote: SocketAddr,
         local_ip: Option<IpAddr>,
         number: Option<u64>,
+        received_len: usize,
         packet: Packet,
     ) -> Result<(), ConnectionError> {
         let state = match self.state {
             State::Established => {
                 match packet.header.space() {
                     SpaceId::Data => {
-                        self.process_payload(now, remote, local_ip, number.unwrap(), packet)?
+                        self.process_payload(
+                            now,
+                            remote,
+                            local_ip,
+                            number.unwrap(),
+                            received_len,
+                            packet,
+                        )?
                     }
                     _ if packet.header.has_frames() => self.process_early_payload(now, packet)?,
                     _ => {
@@ -2692,7 +2764,14 @@ impl Connection {
                 ty: LongType::ZeroRtt,
                 ..
             } => {
-                self.process_payload(now, remote, local_ip, number.unwrap(), packet)?;
+                self.process_payload(
+                    now,
+                    remote,
+                    local_ip,
+                    number.unwrap(),
+                    received_len,
+                    packet,
+                )?;
                 Ok(())
             }
             Header::VersionNegotiate { .. } => {
@@ -2779,6 +2858,7 @@ impl Connection {
         remote: SocketAddr,
         local_ip: Option<IpAddr>,
         number: u64,
+        received_len: usize,
         packet: Packet,
     ) -> Result<(), TransportError> {
         let payload = packet.payload.freeze();
@@ -2851,7 +2931,8 @@ impl Connection {
                     close = Some(reason);
                 }
                 Frame::PathChallenge(token) => {
-                    self.path_responses.push(number, token, remote, local_ip);
+                    self.path_responses
+                        .push(number, token, remote, local_ip, received_len);
                     if remote == self.path.remote {
                         // PATH_CHALLENGE on active path, possible off-path packet forwarding
                         // attack. Send a non-probing packet to recover the active path.
@@ -3087,6 +3168,9 @@ impl Connection {
             self.close = true;
         }
 
+        // A different local destination alone does not prove that the peer has
+        // migrated. Keep ordinary traffic on the active path; path probes are
+        // answered separately from their actual receiving local address.
         if remote != self.path.remote
             && !is_probing_packet
             && number == self.spaces[SpaceId::Data].rx_packet
@@ -3321,7 +3405,10 @@ impl Connection {
 
         // PATH_RESPONSE
         if buf.len() + 9 < max_size && space_id == SpaceId::Data {
-            if let Some(token) = self.path_responses.pop_on_path(self.path.remote) {
+            if let Some(token) = self
+                .path_responses
+                .pop_on_path(self.path.remote, self.path.local_ip)
+            {
                 sent.non_retransmits = true;
                 sent.requires_padding = true;
                 trace!("PATH_RESPONSE {:08x}", token);
@@ -3648,6 +3735,71 @@ impl Connection {
     /// the Acknowledgement Frequency extension
     pub(crate) fn immediate_ack(&mut self) {
         self.spaces[self.highest_space].immediate_ack_pending = true;
+    }
+
+    /// Test-only injection; receiver follows the production authenticated path.
+    #[cfg(test)]
+    pub(crate) fn repro_queue_path_challenge(&mut self) {
+        self.path.challenge = Some(0x918);
+        self.path.challenge_pending = true;
+    }
+
+    /// Construct an authenticated, deliberately unpadded challenge to exercise
+    /// the receiver's anti-amplification handling.
+    #[cfg(test)]
+    pub(crate) fn test_short_path_challenge(
+        &mut self,
+        now: Instant,
+        buf: &mut Vec<u8>,
+    ) -> Transmit {
+        let remote = self.path.remote;
+        let local_ip = self.path.local_ip;
+        let capacity = usize::from(self.path.current_mtu());
+        let builder = PacketBuilder::new(
+            now,
+            SpaceId::Data,
+            self.rem_cids.active(),
+            buf,
+            capacity,
+            0,
+            true,
+            self,
+        )
+        .unwrap();
+        buf.write(frame::FrameType::PATH_CHALLENGE);
+        buf.write(0x918u64);
+        self.path.challenge = Some(0x918);
+        self.stats.frame_tx.path_challenge += 1;
+        builder.finish_and_track(
+            now,
+            self,
+            Some(SentFrames {
+                non_retransmits: true,
+                ..SentFrames::default()
+            }),
+            buf,
+        );
+        self.path.total_sent = self.path.total_sent.saturating_add(buf.len() as u64);
+        self.stats.udp_tx.on_sent(1, buf.len());
+        Transmit {
+            destination: remote,
+            size: buf.len(),
+            ecn: None,
+            segment_size: None,
+            src_ip: local_ip,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_unvalidated_path_bytes(&mut self, received: u64, sent: u64) {
+        self.path.validated = false;
+        self.path.total_recvd = received;
+        self.path.total_sent = sent;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_path_bytes(&self) -> (u64, u64) {
+        (self.path.total_recvd, self.path.total_sent)
     }
 
     /// Decodes a packet, returning its decrypted payload, so it can be inspected in tests

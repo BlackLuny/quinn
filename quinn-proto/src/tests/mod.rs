@@ -36,6 +36,8 @@ mod util;
 use util::*;
 
 mod migration_path;
+#[cfg(target_os = "linux")]
+mod real_socket_1082;
 mod token;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
