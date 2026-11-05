@@ -621,7 +621,7 @@ fn local_probe_on_third_path_does_not_use_candidate_cid() {
 
     let now = pair.time;
     let mut challenge = Vec::new();
-    pair.client_conn_mut(client).test_short_path_challenge(now, &mut challenge);
+    let _ = pair.client_conn_mut(client).test_short_path_challenge(now, &mut challenge);
     let remote = pair.client.addr;
     let mut scratch = Vec::new();
     let Some(DatagramEvent::ConnectionEvent(ch, event)) = pair.server.endpoint.handle(
