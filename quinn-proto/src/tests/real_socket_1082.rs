@@ -2,6 +2,7 @@ use super::*;
 use std::{
     io::{self, IoSliceMut},
     net::UdpSocket,
+    os::fd::AsFd,
     thread,
     time::Duration as StdDuration,
 };
@@ -19,8 +20,14 @@ struct RealSockets {
 
 impl RealSockets {
     fn new(ipv6: bool) -> Self {
+        // The optional socket is created in a separate network namespace by
+        // the test launcher, then inherited as stdin. Cloning the descriptor is
+        // safe and keeps the socket attached to the client's namespace.
+        let inherited = std::env::var_os("ZFC_TEST_INHERITED_UDP").is_some();
         let (listen, ip_a, ip_b, client_ip) = if ipv6 {
             ("[::]:0", "fd00:1082::1", "fd00:1082::2", "fd00:1082::3")
+        } else if inherited {
+            ("0.0.0.0:0", "10.108.2.1", "10.108.2.2", "10.108.2.3")
         } else {
             ("0.0.0.0:0", "127.0.0.1", "127.0.0.2", "127.0.0.3")
         };
@@ -29,7 +36,13 @@ impl RealSockets {
         let server_state = UdpSocketState::new((&server).into()).unwrap();
         let server_a = SocketAddr::new(ip_a.parse().unwrap(), server_port);
         let server_b = SocketAddr::new(ip_b.parse().unwrap(), server_port);
-        let client = UdpSocket::bind(SocketAddr::new(client_ip.parse().unwrap(), 0)).unwrap();
+        let client = if inherited {
+            let fd = std::io::stdin().as_fd().try_clone_to_owned().unwrap();
+            UdpSocket::from(fd)
+        } else {
+            UdpSocket::bind(SocketAddr::new(client_ip.parse().unwrap(), 0)).unwrap()
+        };
+        assert_eq!(client.local_addr().unwrap().ip(), client_ip.parse::<IpAddr>().unwrap());
         client.set_nonblocking(true).unwrap();
         let mut pair = Pair::default();
         pair.server.addr = server_a;
@@ -115,6 +128,68 @@ impl RealSockets {
                         .client
                         .inbound
                         .push_back((now, None, BytesMut::from(&buf[..n])));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("client recv: {e}"),
+            }
+        }
+    }
+
+    /// Route the client's fixed logical peer through a selectable physical
+    /// destination. The server still sees the same client IP:port on the wire.
+    fn pump_migration(
+        &mut self,
+        destination: SocketAddr,
+        drop_client: bool,
+        accept_source: Option<IpAddr>,
+        observed_sources: &mut Vec<IpAddr>,
+    ) {
+        let now = Instant::now();
+        self.pair.time = now;
+        let a = self.server_a;
+        let remote = self.client.local_addr().unwrap();
+        self.pair.client.drive(now, a);
+        for (tx, payload) in self.pair.client.outbound.drain(..) {
+            assert_eq!(tx.destination, a);
+            if !drop_client {
+                assert_eq!(self.client.send_to(&payload, destination).unwrap(), payload.len());
+            }
+        }
+        let mut buf = [0u8; 65536];
+        loop {
+            match self.recv_server(&mut buf) {
+                Ok(meta) => {
+                    assert_eq!(meta.addr, remote);
+                    assert!(meta.dst_ip == Some(self.server_a.ip()) || meta.dst_ip == Some(self.server_b.ip()));
+                    for packet in buf[..meta.len].chunks(meta.stride) {
+                        let mut scratch = Vec::new();
+                        let Some(DatagramEvent::ConnectionEvent(ch, event)) = self.pair.server.endpoint.handle(
+                            now, meta.addr, meta.dst_ip, None, BytesMut::from(packet), &mut scratch,
+                        ) else {
+                            panic!("expected an established server connection");
+                        };
+                        self.pair.server_conn_mut(ch).handle_event(event);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+        self.pair.server.drive(now, remote);
+        let outgoing: Vec<_> = self.pair.server.outbound.drain(..).collect();
+        for (tx, payload) in outgoing {
+            assert_eq!(tx.destination, remote);
+            assert!(tx.src_ip == Some(self.server_a.ip()) || tx.src_ip == Some(self.server_b.ip()));
+            self.send_server(&tx, &payload);
+        }
+        loop {
+            match self.client.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    assert!(from == self.server_a || from == self.server_b);
+                    observed_sources.push(from.ip());
+                    if accept_source.is_none_or(|expected| expected == from.ip()) {
+                        self.pair.client.inbound.push_back((now, None, BytesMut::from(&buf[..n])));
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => panic!("client recv: {e}"),
@@ -379,6 +454,103 @@ fn real_socket_path_response(use_b: bool, ipv6: bool) {
     );
 }
 
+fn real_socket_local_migration(ipv6: bool, fail_validation: bool, fail_mtu_validation: bool) {
+    let _guard = subscribe();
+    let mut rig = RealSockets::new(ipv6);
+    let (client, server) = rig.handshake();
+    let a = rig.server_a;
+    let b = rig.server_b;
+    let remote = rig.client.local_addr().unwrap();
+    let stream = rig.pair.client_streams(client).open(Dir::Bi).unwrap();
+    assert_eq!(rig.pair.client_send(client, stream).write(b"before").unwrap(), 6);
+    rig.receive_stream_bytes(server, stream, b"before", 0, true);
+    assert_eq!(rig.pair.server_send(server, stream).write(b"ack").unwrap(), 3);
+    rig.receive_client_bytes(client, stream, b"ack", 0);
+    assert_eq!(rig.pair.client_send(client, stream).write(b"move").unwrap(), 4);
+
+    let mut observed = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rig.pair.server_conn_mut(server).test_local_path_candidate().is_none() {
+        rig.pump_migration(b, false, None, &mut observed);
+        assert!(Instant::now() < deadline, "new local path was not probed");
+        thread::sleep(StdDuration::from_millis(1));
+    }
+    assert_eq!(rig.pair.server_conn_mut(server).remote_address(), remote);
+    assert_eq!(rig.pair.server_conn_mut(server).local_ip(), Some(a.ip()));
+
+    if fail_mtu_validation {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !rig.pair.server_conn_mut(server).test_local_path_candidate().is_some_and(|candidate| candidate.0) {
+            rig.pump_migration(b, false, None, &mut observed);
+            assert!(Instant::now() < deadline, "short challenge was not validated");
+            thread::sleep(StdDuration::from_millis(1));
+        }
+    }
+    if fail_validation || fail_mtu_validation {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while rig.pair.server_conn_mut(server).test_local_path_candidate().is_some() {
+            // No client datagram reaches the candidate path, including responses
+            // to the server's PATH_CHALLENGE.
+            rig.pump_migration(b, true, None, &mut observed);
+            assert!(Instant::now() < deadline, "failed path did not fall back");
+            thread::sleep(StdDuration::from_millis(1));
+        }
+        assert_eq!(rig.pair.server_conn_mut(server).local_ip(), Some(a.ip()));
+    } else {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while rig.pair.server_conn_mut(server).local_ip() != Some(b.ip()) {
+            rig.pump_migration(b, false, None, &mut observed);
+            assert!(Instant::now() < deadline, "new local path did not validate");
+            thread::sleep(StdDuration::from_millis(1));
+        }
+        assert_eq!(rig.pair.server_conn_mut(server).test_path_validation_state(), (true, false));
+        assert_eq!(rig.pair.server_conn_mut(server).local_ip(), Some(b.ip()));
+    }
+    assert_eq!(rig.pair.client.local_ip, Some(remote.ip()));
+    assert_eq!(rig.pair.server_conn_mut(server).remote_address(), remote);
+    assert!(!rig.pair.server_conn_mut(server).is_closed());
+
+    // Consume the bytes that triggered migration, then prove the same stream
+    // still works after validation or fallback. Only packets from the selected
+    // server source are delivered to the client for the latter assertion.
+    {
+        let mut recv = rig.pair.server_recv(server, stream);
+        let mut chunks = recv.read(true).unwrap();
+        let chunk = chunks.next(usize::MAX).unwrap().unwrap();
+        assert_eq!(chunk.offset, 6);
+        assert_eq!(chunk.bytes.as_ref(), b"move");
+        let _ = chunks.finalize();
+    }
+    let selected = if fail_validation || fail_mtu_validation { a } else { b };
+    let before_reply = observed.len();
+    assert_eq!(rig.pair.server_send(server, stream).write(b"after").unwrap(), 5);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        rig.pump_migration(selected, false, Some(selected.ip()), &mut observed);
+        let mut recv = rig.pair.client_recv(client, stream);
+        let mut chunks = recv.read(true).unwrap();
+        let result = chunks.next(usize::MAX);
+        let _ = chunks.finalize();
+        match result {
+            Ok(Some(chunk)) => {
+                assert_eq!(chunk.offset, 3);
+                assert_eq!(chunk.bytes.as_ref(), b"after");
+                break;
+            }
+            Err(ReadError::Blocked) => {}
+            other => panic!("unexpected client stream read: {other:?}"),
+        }
+        assert!(Instant::now() < deadline, "post-migration reply timed out");
+        thread::sleep(StdDuration::from_millis(1));
+    }
+    assert!(observed[before_reply..].contains(&selected.ip()));
+    println!(
+        "REAL_SOCKET_LOCAL_MIGRATION mode={} client={} old={} candidate={} final={} actual_reply_source={} stream=before+move+after connected=true",
+        if fail_validation { "fallback" } else if fail_mtu_validation { "mtu_fallback" } else { "validated" },
+        remote, a, b, selected, selected.ip()
+    );
+}
+
 #[test]
 fn real_socket_1082_same_destination_control() {
     real_socket_path_response(false, false);
@@ -393,5 +565,62 @@ fn real_socket_1082_changed_destination() {
 #[ignore = "requires fd00:1082::1/::2/::3 in an isolated network namespace"]
 fn real_socket_1082_ipv6_multihomed() {
     real_socket_path_response(false, true);
+    real_socket_path_response(true, true);
+}
+
+#[test]
+fn real_socket_1082_local_migration() {
+    real_socket_local_migration(false, false, false);
+}
+
+#[test]
+fn real_socket_1082_local_migration_fallback() {
+    real_socket_local_migration(false, true, false);
+}
+
+#[test]
+fn real_socket_1082_local_migration_mtu_fallback() {
+    real_socket_local_migration(false, false, true);
+}
+
+#[test]
+#[ignore = "requires fd00:1082::1/::2/::3 in an isolated network namespace"]
+fn real_socket_1082_ipv6_local_migration_and_fallback() {
+    real_socket_local_migration(true, false, false);
+    real_socket_local_migration(true, true, false);
+    real_socket_local_migration(true, false, true);
+}
+
+// Each case runs in a separate process because stdin holds one UDP socket in
+// the peer namespace. The launcher configures IPv4/IPv6 on the veth pair.
+macro_rules! veth_migration_test {
+    ($name:ident, $ipv6:expr, $fail:expr, $fail_mtu:expr) => {
+        #[test]
+        #[ignore = "requires a UDP socket inherited from a separate network namespace"]
+        fn $name() {
+            assert!(std::env::var_os("ZFC_TEST_INHERITED_UDP").is_some());
+            real_socket_local_migration($ipv6, $fail, $fail_mtu);
+        }
+    };
+}
+
+veth_migration_test!(real_socket_1082_veth_ipv4_migration, false, false, false);
+veth_migration_test!(real_socket_1082_veth_ipv4_fallback, false, true, false);
+veth_migration_test!(real_socket_1082_veth_ipv4_mtu_fallback, false, false, true);
+veth_migration_test!(real_socket_1082_veth_ipv6_migration, true, false, false);
+veth_migration_test!(real_socket_1082_veth_ipv6_fallback, true, true, false);
+veth_migration_test!(real_socket_1082_veth_ipv6_mtu_fallback, true, false, true);
+
+#[test]
+#[ignore = "requires a UDP socket inherited from a separate network namespace"]
+fn real_socket_1082_veth_ipv4_response() {
+    assert!(std::env::var_os("ZFC_TEST_INHERITED_UDP").is_some());
+    real_socket_path_response(true, false);
+}
+
+#[test]
+#[ignore = "requires a UDP socket inherited from a separate network namespace"]
+fn real_socket_1082_veth_ipv6_response() {
+    assert!(std::env::var_os("ZFC_TEST_INHERITED_UDP").is_some());
     real_socket_path_response(true, true);
 }

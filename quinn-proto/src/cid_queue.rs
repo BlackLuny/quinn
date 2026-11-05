@@ -98,6 +98,15 @@ impl CidQueue {
         Some((cid_data.1.unwrap(), orig_offset..self.offset))
     }
 
+    /// Unused CIDs in sequence order, excluding the active CID.
+    pub(crate) fn spares(&self) -> impl Iterator<Item = ConnectionId> + '_ {
+        self.iter().skip(1).map(|(_, (cid, _))| cid)
+    }
+
+    pub(crate) fn contains(&self, cid: ConnectionId) -> bool {
+        self.iter().any(|(_, (id, _))| id == cid)
+    }
+
     /// Iterate CIDs in CidQueue that are not `None`, including the active CID
     fn iter(&self) -> impl Iterator<Item = (usize, CidData)> + '_ {
         (0..Self::LEN).filter_map(move |step| {
@@ -148,6 +157,24 @@ mod tests {
 
     fn initial_cid() -> ConnectionId {
         ConnectionId::new(&[0xFF; 8])
+    }
+
+    #[test]
+    fn enumerate_spares_without_changing_the_active_cid() {
+        let mut q = CidQueue::new(initial_cid());
+        let mut first = cid(1, 0);
+        first.id = ConnectionId::new(&[1; 8]);
+        let mut second = cid(2, 0);
+        second.id = ConnectionId::new(&[2; 8]);
+        q.insert(first).unwrap();
+        q.insert(second).unwrap();
+        assert_eq!(q.spares().collect::<Vec<_>>(), vec![first.id, second.id]);
+        assert!(q.contains(initial_cid()));
+        assert!(q.contains(first.id));
+        assert_eq!(q.active(), initial_cid());
+        q.next().unwrap();
+        assert!(!q.contains(initial_cid()));
+        assert_eq!(q.spares().collect::<Vec<_>>(), vec![second.id]);
     }
 
     #[test]
