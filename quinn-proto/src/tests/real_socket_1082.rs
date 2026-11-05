@@ -42,7 +42,10 @@ impl RealSockets {
         } else {
             UdpSocket::bind(SocketAddr::new(client_ip.parse().unwrap(), 0)).unwrap()
         };
-        assert_eq!(client.local_addr().unwrap().ip(), client_ip.parse::<IpAddr>().unwrap());
+        assert_eq!(
+            client.local_addr().unwrap().ip(),
+            client_ip.parse::<IpAddr>().unwrap()
+        );
         client.set_nonblocking(true).unwrap();
         let mut pair = Pair::default();
         pair.server.addr = server_a;
@@ -152,7 +155,10 @@ impl RealSockets {
         for (tx, payload) in self.pair.client.outbound.drain(..) {
             assert_eq!(tx.destination, a);
             if !drop_client {
-                assert_eq!(self.client.send_to(&payload, destination).unwrap(), payload.len());
+                assert_eq!(
+                    self.client.send_to(&payload, destination).unwrap(),
+                    payload.len()
+                );
             }
         }
         let mut buf = [0u8; 65536];
@@ -160,12 +166,22 @@ impl RealSockets {
             match self.recv_server(&mut buf) {
                 Ok(meta) => {
                     assert_eq!(meta.addr, remote);
-                    assert!(meta.dst_ip == Some(self.server_a.ip()) || meta.dst_ip == Some(self.server_b.ip()));
+                    assert!(
+                        meta.dst_ip == Some(self.server_a.ip())
+                            || meta.dst_ip == Some(self.server_b.ip())
+                    );
                     for packet in buf[..meta.len].chunks(meta.stride) {
                         let mut scratch = Vec::new();
-                        let Some(DatagramEvent::ConnectionEvent(ch, event)) = self.pair.server.endpoint.handle(
-                            now, meta.addr, meta.dst_ip, None, BytesMut::from(packet), &mut scratch,
-                        ) else {
+                        let Some(DatagramEvent::ConnectionEvent(ch, event)) =
+                            self.pair.server.endpoint.handle(
+                                now,
+                                meta.addr,
+                                meta.dst_ip,
+                                None,
+                                BytesMut::from(packet),
+                                &mut scratch,
+                            )
+                        else {
                             panic!("expected an established server connection");
                         };
                         self.pair.server_conn_mut(ch).handle_event(event);
@@ -188,7 +204,10 @@ impl RealSockets {
                     assert!(from == self.server_a || from == self.server_b);
                     observed_sources.push(from.ip());
                     if accept_source.is_none_or(|expected| expected == from.ip()) {
-                        self.pair.client.inbound.push_back((now, None, BytesMut::from(&buf[..n])));
+                        self.pair
+                            .client
+                            .inbound
+                            .push_back((now, None, BytesMut::from(&buf[..n])));
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -298,19 +317,50 @@ fn real_socket_path_response(use_b: bool, ipv6: bool) {
     let dest = if use_b { b } else { a };
     let stream = rig.pair.client_streams(client).open(Dir::Bi).unwrap();
     assert_eq!(
-        rig.pair.client_send(client, stream).write(b"before").unwrap(),
+        rig.pair
+            .client_send(client, stream)
+            .write(b"before")
+            .unwrap(),
         6
     );
     rig.receive_stream_bytes(server, stream, b"before", 0, true);
-    assert_eq!(rig.pair.server_send(server, stream).write(b"ack").unwrap(), 3);
+    assert_eq!(
+        rig.pair.server_send(server, stream).write(b"ack").unwrap(),
+        3
+    );
     rig.receive_client_bytes(client, stream, b"ack", 0);
-    assert_eq!(rig.pair.server_conn_mut(server).remote_address(), client_addr);
+    assert_eq!(
+        rig.pair.server_conn_mut(server).remote_address(),
+        client_addr
+    );
     assert_eq!(rig.pair.server_conn_mut(server).local_ip(), Some(a.ip()));
-    let tx_challenge_before = rig.pair.client_conn_mut(client).stats().frame_tx.path_challenge;
-    let rx_challenge_before = rig.pair.server_conn_mut(server).stats().frame_rx.path_challenge;
-    let tx_response_before = rig.pair.server_conn_mut(server).stats().frame_tx.path_response;
-    let rx_response_before = rig.pair.client_conn_mut(client).stats().frame_rx.path_response;
-    rig.pair.client_conn_mut(client).repro_queue_path_challenge();
+    let tx_challenge_before = rig
+        .pair
+        .client_conn_mut(client)
+        .stats()
+        .frame_tx
+        .path_challenge;
+    let rx_challenge_before = rig
+        .pair
+        .server_conn_mut(server)
+        .stats()
+        .frame_rx
+        .path_challenge;
+    let tx_response_before = rig
+        .pair
+        .server_conn_mut(server)
+        .stats()
+        .frame_tx
+        .path_response;
+    let rx_response_before = rig
+        .pair
+        .client_conn_mut(client)
+        .stats()
+        .frame_rx
+        .path_response;
+    rig.pair
+        .client_conn_mut(client)
+        .repro_queue_path_challenge();
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut buf = [0u8; 65536];
     let mut received_count = 0;
@@ -353,7 +403,14 @@ fn real_socket_path_response(use_b: bool, ipv6: bool) {
                 Err(e) => panic!("challenge recv: {e}"),
             }
         }
-        if rig.pair.server_conn_mut(server).stats().frame_rx.path_challenge > rx_challenge_before {
+        if rig
+            .pair
+            .server_conn_mut(server)
+            .stats()
+            .frame_rx
+            .path_challenge
+            > rx_challenge_before
+        {
             break;
         }
         assert!(
@@ -363,22 +420,43 @@ fn real_socket_path_response(use_b: bool, ipv6: bool) {
         thread::sleep(StdDuration::from_millis(1));
     }
     assert_eq!(
-        rig.pair.client_conn_mut(client).stats().frame_tx.path_challenge,
+        rig.pair
+            .client_conn_mut(client)
+            .stats()
+            .frame_tx
+            .path_challenge,
         tx_challenge_before + 1
     );
     assert_eq!(
-        rig.pair.server_conn_mut(server).stats().frame_rx.path_challenge,
+        rig.pair
+            .server_conn_mut(server)
+            .stats()
+            .frame_rx
+            .path_challenge,
         rx_challenge_before + 1
     );
-    assert_eq!(rig.pair.server_conn_mut(server).remote_address(), client_addr);
+    assert_eq!(
+        rig.pair.server_conn_mut(server).remote_address(),
+        client_addr
+    );
 
     let deadline = Instant::now() + Duration::from_secs(3);
     let (response_tx, response_payload) = loop {
         let now = Instant::now();
         let mut payload = Vec::new();
-        let result = rig.pair.server_conn_mut(server).poll_transmit(now, 1, &mut payload);
+        let result = rig
+            .pair
+            .server_conn_mut(server)
+            .poll_transmit(now, 1, &mut payload);
         if let Some(tx) = result {
-            if rig.pair.server_conn_mut(server).stats().frame_tx.path_response > tx_response_before {
+            if rig
+                .pair
+                .server_conn_mut(server)
+                .stats()
+                .frame_tx
+                .path_response
+                > tx_response_before
+            {
                 break (tx, payload);
             }
             rig.send_server(&tx, &payload);
@@ -388,7 +466,11 @@ fn real_socket_path_response(use_b: bool, ipv6: bool) {
         }
     };
     assert_eq!(
-        rig.pair.server_conn_mut(server).stats().frame_tx.path_response,
+        rig.pair
+            .server_conn_mut(server)
+            .stats()
+            .frame_tx
+            .path_response,
         tx_response_before + 1
     );
     assert_eq!(response_tx.destination, client_addr);
@@ -403,17 +485,26 @@ fn real_socket_path_response(use_b: bool, ipv6: bool) {
                 // The harness changes the physical destination behind the client. Present the
                 // original peer to Quinn as a NAT would, while retaining `from` for the actual
                 // source-address assertion below.
-                if let Some(DatagramEvent::ConnectionEvent(ch, event)) = rig.pair.client.endpoint.handle(
-                    now,
-                    a,
-                    Some(client_addr.ip()),
-                    None,
-                    BytesMut::from(&buf[..n]),
-                    &mut output,
-                ) {
+                if let Some(DatagramEvent::ConnectionEvent(ch, event)) =
+                    rig.pair.client.endpoint.handle(
+                        now,
+                        a,
+                        Some(client_addr.ip()),
+                        None,
+                        BytesMut::from(&buf[..n]),
+                        &mut output,
+                    )
+                {
                     assert_eq!(ch, client);
                     rig.pair.client_conn_mut(ch).handle_event(event);
-                    if rig.pair.client_conn_mut(client).stats().frame_rx.path_response > rx_response_before {
+                    if rig
+                        .pair
+                        .client_conn_mut(client)
+                        .stats()
+                        .frame_rx
+                        .path_response
+                        > rx_response_before
+                    {
                         break from;
                     }
                 }
@@ -429,7 +520,11 @@ fn real_socket_path_response(use_b: bool, ipv6: bool) {
         }
     };
     assert_eq!(
-        rig.pair.client_conn_mut(client).stats().frame_rx.path_response,
+        rig.pair
+            .client_conn_mut(client)
+            .stats()
+            .frame_rx
+            .path_response,
         rx_response_before + 1
     );
     assert!(!rig.pair.client_conn_mut(client).is_closed());
@@ -444,9 +539,18 @@ fn real_socket_path_response(use_b: bool, ipv6: bool) {
         dest.ip(),
         "PATH_RESPONSE must use the real receiving destination IP"
     );
-    assert_eq!(rig.pair.client_send(client, stream).write(b"after").unwrap(), 5);
+    assert_eq!(
+        rig.pair
+            .client_send(client, stream)
+            .write(b"after")
+            .unwrap(),
+        5
+    );
     rig.receive_stream_bytes(server, stream, b"after", 6, false);
-    assert_eq!(rig.pair.server_send(server, stream).write(b"done").unwrap(), 4);
+    assert_eq!(
+        rig.pair.server_send(server, stream).write(b"done").unwrap(),
+        4
+    );
     rig.receive_client_bytes(client, stream, b"done", 3);
     println!(
         "REAL_SOCKET_1082 handshake=ok client={} server_a={} server_b={} destination={} received_datagrams={} challenge_rx_delta=1 response_tx_delta=1 response_rx_delta=1 quinn_src={} actual_src={} connected=true stream_client=6+5 stream_server=3+4",
@@ -462,15 +566,32 @@ fn real_socket_local_migration(ipv6: bool, fail_validation: bool, fail_mtu_valid
     let b = rig.server_b;
     let remote = rig.client.local_addr().unwrap();
     let stream = rig.pair.client_streams(client).open(Dir::Bi).unwrap();
-    assert_eq!(rig.pair.client_send(client, stream).write(b"before").unwrap(), 6);
+    assert_eq!(
+        rig.pair
+            .client_send(client, stream)
+            .write(b"before")
+            .unwrap(),
+        6
+    );
     rig.receive_stream_bytes(server, stream, b"before", 0, true);
-    assert_eq!(rig.pair.server_send(server, stream).write(b"ack").unwrap(), 3);
+    assert_eq!(
+        rig.pair.server_send(server, stream).write(b"ack").unwrap(),
+        3
+    );
     rig.receive_client_bytes(client, stream, b"ack", 0);
-    assert_eq!(rig.pair.client_send(client, stream).write(b"move").unwrap(), 4);
+    assert_eq!(
+        rig.pair.client_send(client, stream).write(b"move").unwrap(),
+        4
+    );
 
     let mut observed = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while rig.pair.server_conn_mut(server).test_local_path_candidate().is_none() {
+    while rig
+        .pair
+        .server_conn_mut(server)
+        .test_local_path_candidate()
+        .is_none()
+    {
         rig.pump_migration(b, false, None, &mut observed);
         assert!(Instant::now() < deadline, "new local path was not probed");
         thread::sleep(StdDuration::from_millis(1));
@@ -480,15 +601,28 @@ fn real_socket_local_migration(ipv6: bool, fail_validation: bool, fail_mtu_valid
 
     if fail_mtu_validation {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !rig.pair.server_conn_mut(server).test_local_path_candidate().is_some_and(|candidate| candidate.0) {
+        while !rig
+            .pair
+            .server_conn_mut(server)
+            .test_local_path_candidate()
+            .is_some_and(|candidate| candidate.0)
+        {
             rig.pump_migration(b, false, None, &mut observed);
-            assert!(Instant::now() < deadline, "short challenge was not validated");
+            assert!(
+                Instant::now() < deadline,
+                "short challenge was not validated"
+            );
             thread::sleep(StdDuration::from_millis(1));
         }
     }
     if fail_validation || fail_mtu_validation {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while rig.pair.server_conn_mut(server).test_local_path_candidate().is_some() {
+        while rig
+            .pair
+            .server_conn_mut(server)
+            .test_local_path_candidate()
+            .is_some()
+        {
             // No client datagram reaches the candidate path, including responses
             // to the server's PATH_CHALLENGE.
             rig.pump_migration(b, true, None, &mut observed);
@@ -503,7 +637,12 @@ fn real_socket_local_migration(ipv6: bool, fail_validation: bool, fail_mtu_valid
             assert!(Instant::now() < deadline, "new local path did not validate");
             thread::sleep(StdDuration::from_millis(1));
         }
-        assert_eq!(rig.pair.server_conn_mut(server).test_path_validation_state(), (true, false));
+        assert_eq!(
+            rig.pair
+                .server_conn_mut(server)
+                .test_path_validation_state(),
+            (true, false)
+        );
         assert_eq!(rig.pair.server_conn_mut(server).local_ip(), Some(b.ip()));
     }
     assert_eq!(rig.pair.client.local_ip, Some(remote.ip()));
@@ -521,9 +660,19 @@ fn real_socket_local_migration(ipv6: bool, fail_validation: bool, fail_mtu_valid
         assert_eq!(chunk.bytes.as_ref(), b"move");
         let _ = chunks.finalize();
     }
-    let selected = if fail_validation || fail_mtu_validation { a } else { b };
+    let selected = if fail_validation || fail_mtu_validation {
+        a
+    } else {
+        b
+    };
     let before_reply = observed.len();
-    assert_eq!(rig.pair.server_send(server, stream).write(b"after").unwrap(), 5);
+    assert_eq!(
+        rig.pair
+            .server_send(server, stream)
+            .write(b"after")
+            .unwrap(),
+        5
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         rig.pump_migration(selected, false, Some(selected.ip()), &mut observed);
@@ -546,8 +695,18 @@ fn real_socket_local_migration(ipv6: bool, fail_validation: bool, fail_mtu_valid
     assert!(observed[before_reply..].contains(&selected.ip()));
     println!(
         "REAL_SOCKET_LOCAL_MIGRATION mode={} client={} old={} candidate={} final={} actual_reply_source={} stream=before+move+after connected=true",
-        if fail_validation { "fallback" } else if fail_mtu_validation { "mtu_fallback" } else { "validated" },
-        remote, a, b, selected, selected.ip()
+        if fail_validation {
+            "fallback"
+        } else if fail_mtu_validation {
+            "mtu_fallback"
+        } else {
+            "validated"
+        },
+        remote,
+        a,
+        b,
+        selected,
+        selected.ip()
     );
 }
 
@@ -559,9 +718,18 @@ fn real_socket_local_path_backoff(ipv6: bool) {
     let b = rig.server_b;
     let remote = rig.client.local_addr().unwrap();
     let stream = rig.pair.client_streams(client).open(Dir::Bi).unwrap();
-    assert_eq!(rig.pair.client_send(client, stream).write(b"before").unwrap(), 6);
+    assert_eq!(
+        rig.pair
+            .client_send(client, stream)
+            .write(b"before")
+            .unwrap(),
+        6
+    );
     rig.receive_stream_bytes(server, stream, b"before", 0, true);
-    assert_eq!(rig.pair.server_send(server, stream).write(b"ack").unwrap(), 3);
+    assert_eq!(
+        rig.pair.server_send(server, stream).write(b"ack").unwrap(),
+        3
+    );
     rig.receive_client_bytes(client, stream, b"ack", 0);
 
     let deadline = Instant::now() + Duration::from_secs(25);
@@ -578,21 +746,47 @@ fn real_socket_local_path_backoff(ipv6: bool) {
         // Client traffic reaches B, but packets sent from B are dropped before
         // the client can answer. Packets from the active path A still work.
         rig.pump_migration(b, false, Some(a.ip()), &mut observed);
-        let backoff = rig.pair.server_conn_mut(server).test_local_path_backoff(remote, b.ip());
-        if let Some((failures, retry_at)) = backoff.filter(|(failures, _)| *failures > delays.len() as u32) {
-            assert!(rig.pair.server_conn_mut(server).test_local_path_candidate().is_none());
+        let backoff = rig
+            .pair
+            .server_conn_mut(server)
+            .test_local_path_backoff(remote, b.ip());
+        if let Some((failures, retry_at)) =
+            backoff.filter(|(failures, _)| *failures > delays.len() as u32)
+        {
+            assert!(
+                rig.pair
+                    .server_conn_mut(server)
+                    .test_local_path_candidate()
+                    .is_none()
+            );
             let remaining = retry_at.saturating_duration_since(Instant::now());
             assert!(remaining >= Duration::from_millis(if failures == 1 { 500 } else { 1200 }));
             delays.push(remaining);
-            let challenges = rig.pair.server_conn_mut(server).stats().frame_tx.path_challenge;
+            let challenges = rig
+                .pair
+                .server_conn_mut(server)
+                .stats()
+                .frame_tx
+                .path_challenge;
             if failures == 1 {
-                assert_eq!(rig.pair.server_send(server, stream).write(b"alive").unwrap(), 5);
+                assert_eq!(
+                    rig.pair
+                        .server_send(server, stream)
+                        .write(b"alive")
+                        .unwrap(),
+                    5
+                );
             }
             while Instant::now() + Duration::from_millis(100) < retry_at {
                 rig.pair.client_conn_mut(client).ping();
                 rig.pump_migration(b, false, Some(a.ip()), &mut observed);
-                assert!(rig.pair.server_conn_mut(server).test_local_path_candidate().is_none(),
-                    "continuous B traffic must not bypass the cooldown");
+                assert!(
+                    rig.pair
+                        .server_conn_mut(server)
+                        .test_local_path_candidate()
+                        .is_none(),
+                    "continuous B traffic must not bypass the cooldown"
+                );
                 assert_eq!(rig.pair.server_conn_mut(server).local_ip(), Some(a.ip()));
                 if failures == 1 && !live_stream {
                     let mut recv = rig.pair.client_recv(client, stream);
@@ -611,13 +805,26 @@ fn real_socket_local_path_backoff(ipv6: bool) {
                 }
                 thread::sleep(StdDuration::from_millis(20));
             }
-            assert_eq!(rig.pair.server_conn_mut(server).stats().frame_tx.path_challenge, challenges,
-                "cooldown must not emit more path challenges");
+            assert_eq!(
+                rig.pair
+                    .server_conn_mut(server)
+                    .stats()
+                    .frame_tx
+                    .path_challenge,
+                challenges,
+                "cooldown must not emit more path challenges"
+            );
         }
-        assert!(Instant::now() < deadline, "two local-path timeouts did not complete");
+        assert!(
+            Instant::now() < deadline,
+            "two local-path timeouts did not complete"
+        );
         thread::sleep(StdDuration::from_millis(5));
     }
-    assert!(live_stream, "the original path must keep its existing stream usable");
+    assert!(
+        live_stream,
+        "the original path must keep its existing stream usable"
+    );
     assert!(delays[1] > delays[0], "the second cooldown must grow");
 
     // Restore B-to-client traffic. A fresh packet after the retry deadline
@@ -625,11 +832,22 @@ fn real_socket_local_path_backoff(ipv6: bool) {
     while rig.pair.server_conn_mut(server).local_ip() != Some(b.ip()) {
         rig.pair.client_conn_mut(client).ping();
         rig.pump_migration(b, false, None, &mut observed);
-        assert!(Instant::now() < deadline, "B did not recover after its cooldown");
+        assert!(
+            Instant::now() < deadline,
+            "B did not recover after its cooldown"
+        );
         thread::sleep(StdDuration::from_millis(5));
     }
-    assert!(rig.pair.server_conn_mut(server).test_local_path_backoff(remote, b.ip()).is_none());
-    assert_eq!(rig.pair.server_send(server, stream).write(b"ok").unwrap(), 2);
+    assert!(
+        rig.pair
+            .server_conn_mut(server)
+            .test_local_path_backoff(remote, b.ip())
+            .is_none()
+    );
+    assert_eq!(
+        rig.pair.server_send(server, stream).write(b"ok").unwrap(),
+        2
+    );
     let after_switch = observed.len();
     loop {
         rig.pump_migration(b, false, None, &mut observed);
@@ -654,7 +872,11 @@ fn real_socket_local_path_backoff(ipv6: bool) {
     assert!(!rig.pair.server_conn_mut(server).is_closed());
     println!(
         "REAL_SOCKET_BACKOFF client={} old={} candidate={} cooldown_ms={}/{} continuous_b=true stream_a=alive recovered_b=true stream_b=ok connected=true",
-        remote, a, b, delays[0].as_millis(), delays[1].as_millis()
+        remote,
+        a,
+        b,
+        delays[0].as_millis(),
+        delays[1].as_millis()
     );
 }
 
@@ -666,17 +888,33 @@ fn real_socket_cid_exhaustion_recovery(ipv6: bool) {
     let b = rig.server_b;
     let remote = rig.client.local_addr().unwrap();
     let stream = rig.pair.client_streams(client).open(Dir::Bi).unwrap();
-    assert_eq!(rig.pair.client_send(client, stream).write(b"before").unwrap(), 6);
+    assert_eq!(
+        rig.pair
+            .client_send(client, stream)
+            .write(b"before")
+            .unwrap(),
+        6
+    );
     rig.receive_stream_bytes(server, stream, b"before", 0, true);
-    assert_eq!(rig.pair.server_send(server, stream).write(b"ack").unwrap(), 3);
+    assert_eq!(
+        rig.pair.server_send(server, stream).write(b"ack").unwrap(),
+        3
+    );
     rig.receive_client_bytes(client, stream, b"ack", 0);
 
     let last = rig.pair.server_conn_mut(server).test_keep_one_spare_cid();
     rig.pair.client_conn_mut(client).ping();
     let mut observed = Vec::new();
-    let discard: IpAddr = if ipv6 { "2001:db8::1" } else { "192.0.2.1" }.parse().unwrap();
+    let discard: IpAddr = if ipv6 { "2001:db8::1" } else { "192.0.2.1" }
+        .parse()
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(8);
-    while rig.pair.server_conn_mut(server).test_local_path_candidate().is_none_or(|x| x.4 == 0) {
+    while rig
+        .pair
+        .server_conn_mut(server)
+        .test_local_path_candidate()
+        .is_none_or(|x| x.4 == 0)
+    {
         // Receive the candidate probes on actual sockets but withhold them
         // from the client so no response or CID retirement is processed yet.
         rig.pump_migration(b, false, Some(discard), &mut observed);
@@ -684,26 +922,62 @@ fn real_socket_cid_exhaustion_recovery(ipv6: bool) {
         thread::sleep(StdDuration::from_millis(1));
     }
     assert!(observed.contains(&b.ip()));
-    assert_eq!(rig.pair.server_conn_mut(server).test_local_candidate_cid(), Some(last.id));
+    assert_eq!(
+        rig.pair.server_conn_mut(server).test_local_candidate_cid(),
+        Some(last.id)
+    );
 
-    rig.pair.client_conn_mut(client).test_reissue_cid_with_retirement(last);
+    rig.pair
+        .client_conn_mut(client)
+        .test_reissue_cid_with_retirement(last);
     rig.pair.client_conn_mut(client).ping();
-    let retired_before = rig.pair.server_conn_mut(server).stats().frame_tx.retire_connection_id;
+    let retired_before = rig
+        .pair
+        .server_conn_mut(server)
+        .stats()
+        .frame_tx
+        .retire_connection_id;
     let deadline = Instant::now() + Duration::from_secs(8);
     while rig.pair.server_conn_mut(server).test_remote_cids().0 != last.id {
         rig.pump_migration(a, false, Some(a.ip()), &mut observed);
-        assert!(Instant::now() < deadline, "peer retirement was not processed");
+        assert!(
+            Instant::now() < deadline,
+            "peer retirement was not processed"
+        );
         thread::sleep(StdDuration::from_millis(1));
     }
     assert_eq!(rig.pair.server_conn_mut(server).local_ip(), Some(a.ip()));
     assert_eq!(rig.pair.server_conn_mut(server).remote_address(), remote);
-    assert!(rig.pair.server_conn_mut(server).test_remote_cids().1.is_none());
-    assert!(rig.pair.server_conn_mut(server).test_active_cid_used_on_another_path());
-    assert!(rig.pair.server_conn_mut(server).stats().frame_tx.retire_connection_id > retired_before,
-        "the peer must receive a retirement to replenish its CID pool");
+    assert!(
+        rig.pair
+            .server_conn_mut(server)
+            .test_remote_cids()
+            .1
+            .is_none()
+    );
+    assert!(
+        rig.pair
+            .server_conn_mut(server)
+            .test_active_cid_used_on_another_path()
+    );
+    assert!(
+        rig.pair
+            .server_conn_mut(server)
+            .stats()
+            .frame_tx
+            .retire_connection_id
+            > retired_before,
+        "the peer must receive a retirement to replenish its CID pool"
+    );
 
     let before_reply = observed.len();
-    assert_eq!(rig.pair.server_send(server, stream).write(b"after").unwrap(), 5);
+    assert_eq!(
+        rig.pair
+            .server_send(server, stream)
+            .write(b"after")
+            .unwrap(),
+        5
+    );
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         rig.pump_migration(a, false, Some(a.ip()), &mut observed);
@@ -720,23 +994,38 @@ fn real_socket_cid_exhaustion_recovery(ipv6: bool) {
             Err(ReadError::Blocked) => {}
             other => panic!("unexpected client stream read: {other:?}"),
         }
-        assert!(Instant::now() < deadline, "CID exhaustion stalled the stream");
+        assert!(
+            Instant::now() < deadline,
+            "CID exhaustion stalled the stream"
+        );
         thread::sleep(StdDuration::from_millis(1));
     }
     assert!(observed[before_reply..].contains(&a.ip()));
     let deadline = Instant::now() + Duration::from_secs(8);
     while rig.pair.server_conn_mut(server).test_remote_cids().0 == last.id {
         rig.pump_migration(a, false, Some(a.ip()), &mut observed);
-        assert!(Instant::now() < deadline, "replacement CID did not restore isolation");
+        assert!(
+            Instant::now() < deadline,
+            "replacement CID did not restore isolation"
+        );
         thread::sleep(StdDuration::from_millis(1));
     }
-    assert_eq!(rig.pair.client_send(client, stream).write(b"resume").unwrap(), 6);
+    assert_eq!(
+        rig.pair
+            .client_send(client, stream)
+            .write(b"resume")
+            .unwrap(),
+        6
+    );
     rig.receive_stream_bytes(server, stream, b"resume", 6, false);
     assert!(!rig.pair.client_conn_mut(client).is_closed());
     assert!(!rig.pair.server_conn_mut(server).is_closed());
     println!(
         "REAL_SOCKET_CID_RECOVERY client={} old={} candidate={} fallback_source={} retired=true replacement=true stream=before+after+resume connected=true",
-        remote, a, b, a.ip()
+        remote,
+        a,
+        b,
+        a.ip()
     );
 }
 
@@ -749,9 +1038,18 @@ fn real_socket_1082_cid_exhaustion_nat_rebinding() {
     let b = rig.server_b;
     let old_remote = rig.client.local_addr().unwrap();
     let stream = rig.pair.client_streams(client).open(Dir::Bi).unwrap();
-    assert_eq!(rig.pair.client_send(client, stream).write(b"before").unwrap(), 6);
+    assert_eq!(
+        rig.pair
+            .client_send(client, stream)
+            .write(b"before")
+            .unwrap(),
+        6
+    );
     rig.receive_stream_bytes(server, stream, b"before", 0, true);
-    assert_eq!(rig.pair.server_send(server, stream).write(b"ack").unwrap(), 3);
+    assert_eq!(
+        rig.pair.server_send(server, stream).write(b"ack").unwrap(),
+        3
+    );
     rig.receive_client_bytes(client, stream, b"ack", 0);
 
     let last = rig.pair.server_conn_mut(server).test_keep_one_spare_cid();
@@ -760,13 +1058,21 @@ fn real_socket_1082_cid_exhaustion_nat_rebinding() {
     let mut observed = Vec::new();
     let discard: IpAddr = "192.0.2.1".parse().unwrap();
     let deadline = Instant::now() + Duration::from_secs(8);
-    while rig.pair.server_conn_mut(server).test_local_path_candidate().is_none_or(|x| x.4 == 0) {
+    while rig
+        .pair
+        .server_conn_mut(server)
+        .test_local_path_candidate()
+        .is_none_or(|x| x.4 == 0)
+    {
         rig.pump_migration(b, false, Some(discard), &mut observed);
         assert!(Instant::now() < deadline, "candidate CID was not used");
         thread::sleep(StdDuration::from_millis(1));
     }
     assert!(observed.contains(&b.ip()));
-    assert_eq!(rig.pair.server_conn_mut(server).test_local_candidate_cid(), Some(last.id));
+    assert_eq!(
+        rig.pair.server_conn_mut(server).test_local_candidate_cid(),
+        Some(last.id)
+    );
 
     let replacement = UdpSocket::bind(SocketAddr::new(old_remote.ip(), 0)).unwrap();
     replacement.set_nonblocking(true).unwrap();
@@ -791,9 +1097,16 @@ fn real_socket_1082_cid_exhaustion_nat_rebinding() {
                     assert_eq!(meta.dst_ip, Some(a.ip()));
                     for packet in buf[..meta.len].chunks(meta.stride) {
                         let mut scratch = Vec::new();
-                        let Some(DatagramEvent::ConnectionEvent(ch, event)) = rig.pair.server.endpoint.handle(
-                            now, meta.addr, meta.dst_ip, None, BytesMut::from(packet), &mut scratch,
-                        ) else {
+                        let Some(DatagramEvent::ConnectionEvent(ch, event)) =
+                            rig.pair.server.endpoint.handle(
+                                now,
+                                meta.addr,
+                                meta.dst_ip,
+                                None,
+                                BytesMut::from(packet),
+                                &mut scratch,
+                            )
+                        else {
                             panic!("rebound packet must route to the connection");
                         };
                         rig.pair.server_conn_mut(ch).handle_event(event);
@@ -803,11 +1116,17 @@ fn real_socket_1082_cid_exhaustion_nat_rebinding() {
                 Err(e) => panic!("server recv: {e}"),
             }
         }
-        assert!(Instant::now() < deadline, "rebound source port was not detected");
+        assert!(
+            Instant::now() < deadline,
+            "rebound source port was not detected"
+        );
         thread::sleep(StdDuration::from_millis(1));
     }
     assert_eq!(rig.pair.server_conn_mut(server).local_ip(), Some(a.ip()));
-    assert_eq!(rig.pair.server_conn_mut(server).test_remote_cids().0, old_cid);
+    assert_eq!(
+        rig.pair.server_conn_mut(server).test_remote_cids().0,
+        old_cid
+    );
     rig.pair.server_conn_mut(server).ping();
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut active_sent = false;
@@ -822,10 +1141,19 @@ fn real_socket_1082_cid_exhaustion_nat_rebinding() {
             rig.send_server(&tx, &payload);
             active_sent |= tx.destination == new_remote;
         }
-        assert!(Instant::now() < deadline, "rebound path stalled after CID exhaustion");
+        assert!(
+            Instant::now() < deadline,
+            "rebound path stalled after CID exhaustion"
+        );
         thread::sleep(StdDuration::from_millis(1));
     }
-    assert_eq!(rig.pair.server_send(server, stream).write(b"after").unwrap(), 5);
+    assert_eq!(
+        rig.pair
+            .server_send(server, stream)
+            .write(b"after")
+            .unwrap(),
+        5
+    );
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         rig.pump_migration(a, false, Some(a.ip()), &mut observed);

@@ -411,8 +411,11 @@ impl PathResponses {
         local_ip: Option<IpAddr>,
     ) -> Option<(SocketAddr, Option<IpAddr>, usize)> {
         let response = self.pending.last()?;
-        (!response.matches_path(remote, local_ip))
-            .then_some((response.remote, response.local_ip, response.response_limit))
+        (!response.matches_path(remote, local_ip)).then_some((
+            response.remote,
+            response.local_ip,
+            response.response_limit,
+        ))
     }
 
     pub(crate) fn pop_off_path(
