@@ -270,7 +270,7 @@ struct LocalPathCandidate {
 struct LocalPathCidUse {
     cid: ConnectionId,
     remote: SocketAddr,
-    local_ip: IpAddr,
+    local_ip: Option<IpAddr>,
 }
 
 impl Connection {
@@ -991,7 +991,7 @@ impl Connection {
                     if remote == self.path.remote {
                         if let (Some(active), Some(received)) = (self.path.local_ip, local_ip) {
                             if active != received {
-                                self.mark_local_path_cid_used(cid, remote, received);
+                                self.mark_local_path_cid_used(cid, remote, Some(received));
                             }
                         }
                     }
@@ -1183,7 +1183,7 @@ impl Connection {
 
     fn cid_usable_for_path(&self, cid: ConnectionId, remote: SocketAddr, local_ip: Option<IpAddr>) -> bool {
         self.local_path_cid_uses.iter().find(|used| used.cid == cid)
-            .is_none_or(|used| used.remote == remote && Some(used.local_ip) == local_ip)
+            .is_none_or(|used| used.remote == remote && used.local_ip == local_ip)
     }
 
     fn prune_local_path_cid_uses(&mut self) {
@@ -1191,7 +1191,7 @@ impl Connection {
         self.local_path_cid_uses.retain(|used| cids.contains(used.cid));
     }
 
-    fn mark_local_path_cid_used(&mut self, cid: ConnectionId, remote: SocketAddr, local_ip: IpAddr) {
+    fn mark_local_path_cid_used(&mut self, cid: ConnectionId, remote: SocketAddr, local_ip: Option<IpAddr>) {
         self.prune_local_path_cid_uses();
         if !self.local_path_cid_uses.iter().any(|used| used.cid == cid) {
             self.local_path_cid_uses.push(LocalPathCidUse { cid, remote, local_ip });
@@ -1401,7 +1401,7 @@ impl Connection {
         candidate.total_sent = candidate.total_sent.saturating_add(buf.len() as u64);
         candidate.challenge_pending = false;
         candidate.challenge_was_unpadded |= buf.len() < MIN_INITIAL_SIZE as usize;
-        self.mark_local_path_cid_used(cid, remote, local_ip);
+        self.mark_local_path_cid_used(cid, remote, Some(local_ip));
         self.path.pacing.on_transmit(buf.len() as u16);
         self.stats.frame_tx.path_challenge += 1;
         self.stats.udp_tx.on_sent(1, buf.len());
@@ -3554,6 +3554,8 @@ impl Connection {
             if remote != self.path.remote {
                 self.cancel_local_path_candidate();
                 let _ = self.ensure_active_cid_for_path();
+                let previous_remote = self.path.remote;
+                let previous_local_ip = self.path.local_ip;
                 let ConnectionSide::Server { ref server_config } = self.side else {
                     panic!("packets from unknown remote should be dropped by clients");
                 };
@@ -3564,6 +3566,14 @@ impl Connection {
                 self.migrate(now, remote, local_ip);
                 // Break linkability, if possible
                 if !self.update_rem_cid_for_path() {
+                    if previous_local_ip != local_ip {
+                        // Remember the old path even when its local metadata
+                        // is unavailable. A later replacement CID can then
+                        // end the temporary cross-local-address reuse.
+                        self.mark_local_path_cid_used(
+                            self.rem_cids.active(), previous_remote, previous_local_ip,
+                        );
+                    }
                     // No spare CID: the token stays, but the endpoint must look it up at the new address.
                     self.republish_reset_token();
                 }

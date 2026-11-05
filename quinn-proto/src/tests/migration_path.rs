@@ -625,6 +625,43 @@ fn cid_exhaustion_does_not_block_connection_close() {
 }
 
 #[test]
+fn cid_exhaustion_remote_and_local_move_recovers_isolation() {
+    let _guard = subscribe();
+    let a: IpAddr = "127.0.0.1".parse().unwrap();
+    let b: IpAddr = "127.0.0.2".parse().unwrap();
+    for (old_local, new_local) in [(Some(a), Some(b)), (Some(a), None), (None, Some(b))] {
+        let mut pair = Pair::default();
+        pair.client.addr = "127.0.0.3:4567".parse().unwrap();
+        pair.server.local_ip = old_local;
+        let (client, server) = pair.connect();
+        pair.drive();
+        pair.server_conn_mut(server).test_exhaust_spare_cids();
+        let previous_cid = pair.server_conn_mut(server).test_remote_cids().0;
+        let rebound: SocketAddr = "127.0.0.3:4568".parse().unwrap();
+        pair.client.addr = rebound;
+        pair.client_conn_mut(client).ping();
+        pair.drive_client();
+        pair.server.local_ip = new_local;
+        receive_only(&mut pair, server);
+        assert_eq!(pair.server_conn_mut(server).remote_address(), rebound);
+        assert_eq!(pair.server_conn_mut(server).local_ip(), new_local);
+        assert_eq!(pair.server_conn_mut(server).test_remote_cids().0, previous_cid);
+        assert!(pair.server_conn_mut(server).test_active_cid_used_on_another_path(),
+            "a potentially changed local path must retain the old CID binding");
+        let before = pair.client_conn_mut(client).stats().frame_rx.ping;
+        pair.server_conn_mut(server).ping();
+        pair.drive_server();
+        assert!(!pair.client.inbound.is_empty(), "CID exhaustion must not stop migration");
+        pair.drive();
+        assert!(pair.client_conn_mut(client).stats().frame_rx.ping > before);
+        assert_ne!(pair.server_conn_mut(server).test_remote_cids().0, previous_cid,
+            "a replacement CID must end temporary reuse");
+        assert!(!pair.server_conn_mut(server).test_active_cid_used_on_another_path());
+        assert_bidirectional_stream(&mut pair, client, server);
+    }
+}
+
+#[test]
 fn local_destination_challenge_preserves_active_path_and_rejects_replay() {
     let _guard = subscribe();
     let v4a: IpAddr = "127.0.0.1".parse().unwrap();
